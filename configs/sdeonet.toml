@@ -1,0 +1,33 @@
+[experiment_config]
+dataset_name = "ou_process"
+optimizer = "adam"
+learning_rate = 0.001
+weight_decay = 0.000001
+seed = 1
+batch_size = 128
+epochs = 200
+
+[nn_config]
+# SDEONet model parameters
+basis_in_dim = 64
+basis_out_dim = 96
+T = 1.0
+hermite_M = 12
+wick_order = 2
+
+# Time positional encoding
+use_posenc = true
+pe_dim = 128
+include_raw_time = false
+
+# Branch MLP
+branch_width = 512
+branch_depth = 4
+
+# Trunk MLP
+trunk_width = 512
+trunk_depth = 4
+
+# Normalization/skip
+use_layernorm = false
+residual = false
