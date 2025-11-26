@@ -13,7 +13,11 @@ dependencies = [
     "pydantic>=2.12.3",
     "tqdm>=4.67.1",
     "quicksig @ git+https://github.com/luke-a-thompson/QuickSig.git@master",
+    "mypy>=1.18.2",
 ]
+
+[project.scripts]
+train = "taming_the_ito_lyon.training.train_cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -164,7 +164,7 @@ class NeuralRDE(eqx.Module):
         indices = jnp.arange(values.shape[0] - 1)
         return jax.vmap(window_logsig)(indices)
 
-    def _rollout_hidden(self, h0: jax.Array, logsigs: jax.Array, T: int) -> jax.Array:
+    def _rollout_hidden(self, h0: jax.Array, logsigs: jax.Array) -> jax.Array:
         """
         Discrete log-ODE rollout across intervals using a scan.
 
@@ -184,9 +184,7 @@ class NeuralRDE(eqx.Module):
     def __call__(
         self,
         ts: jax.Array,
-        control_or_coeffs: diffrax.AbstractPath | tuple[jax.Array, ...],
-        *,
-        evolving_out: bool = True,
+        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     ) -> jax.Array:
         """
         Forward pass.
@@ -200,19 +198,15 @@ class NeuralRDE(eqx.Module):
         - If self.evolving_out is False: shape (out_size,)
         - If self.evolving_out is True: shape (T, out_size)
         """
-        if isinstance(control_or_coeffs, diffrax.AbstractPath):
-            control = control_or_coeffs
-        else:
-            control = diffrax.CubicInterpolation(ts, control_or_coeffs)
+        control = diffrax.CubicInterpolation(ts, coeffs)
 
         x0 = control.evaluate(ts[0])
         h0 = self.initial(x0)
 
         logsigs = self._compute_logsignatures(ts, control)  # (T-1 or T-stride, L)
-        hidden_over_time = self._rollout_hidden(h0, logsigs, T=ts.shape[0])  # (T, H)
+        hidden_over_time = self._rollout_hidden(h0, logsigs)  # (T, H)
 
-        use_evolving = bool(evolving_out)
-        if use_evolving:
+        if self.evolving_out:
 
             def apply_readout(y: jax.Array) -> jax.Array:
                 return self.readout_activation(self.readout(y))

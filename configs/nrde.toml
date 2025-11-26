@@ -5,7 +5,7 @@ learning_rate = 0.001
 weight_decay = 0.000001
 seed = 1
 batch_size = 128
-epochs = 200
+epochs = 10
 
 [nn_config]
 # NRDE model parameters
@@ -16,4 +16,4 @@ out_size = 1
 
 # Log-signature configuration
 signature_depth = 3
-signature_window_size = 8
+signature_window_size = 16

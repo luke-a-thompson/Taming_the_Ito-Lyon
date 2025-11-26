@@ -19,17 +19,19 @@ def add_time_channel(values: jax.Array) -> jax.Array:
     return jnp.concatenate([time_channel, values], axis=-1)
 
 
-def compute_cubic_coeffs_batch(ts: jax.Array, ys: jax.Array) -> tuple[jax.Array, ...]:
+def compute_cubic_coeffs_batch(
+    ts: jax.Array, ys: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """
     Compute batched Hermite cubic spline coefficients.
 
     ts: shape (T,)
     ys: shape (B, T, C)
-    returns: tuple of arrays each of shape (B, T, C)
+    returns: tuple of 4 arrays each of shape (B, T, C)
     """
     vmapped = jax.vmap(diffrax.backward_hermite_coefficients, in_axes=(None, 0))
-    coeffs = vmapped(ts, ys)
-    return coeffs
+    a, b, c, d = vmapped(ts, ys)
+    return (a, b, c, d)
 
 
 def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
@@ -48,7 +50,7 @@ def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
 
 def prepare_dataset(
     npz_path: str, *, key: jax.Array
-) -> tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
+) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """
     Load dataset and precompute cubic coefficients with time channel.
 
@@ -60,7 +62,11 @@ def prepare_dataset(
     del key  # key kept for future stochastic data transforms
     solution, driver = load_npz_dataset(npz_path)
     tqdm.write(
-        f"Loaded dataset with shape dtype {solution.dtype} (batch: {solution.shape[0]}, length: {solution.shape[1]}, channels: {solution.shape[2]}) and {driver.dtype} (batch: {driver.shape[0]}, length: {driver.shape[1]}, channels: {driver.shape[2]})"
+        (
+            f"Loaded dataset from {npz_path}:\n"
+            f"  solution: dtype={solution.dtype}, shape=(batch={solution.shape[0]}, length={solution.shape[1]}, channels={solution.shape[2]})\n"
+            f"  driver:   dtype={driver.dtype}, shape=(batch={driver.shape[0]}, length={driver.shape[1]}, channels={driver.shape[2]})"
+        )
     )
 
     batch_size, length, _ = driver.shape
@@ -75,7 +81,7 @@ def prepare_dataset(
 def split_train_val_test(
     ts_batched: jax.Array,
     solution: jax.Array,
-    coeffs_batched: tuple[jax.Array, ...],
+    coeffs_batched: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     *,
     train_fraction: float = 0.6,
     val_fraction: float = 0.2,
@@ -83,13 +89,13 @@ def split_train_val_test(
 ) -> tuple[
     jax.Array,
     jax.Array,
-    tuple[jax.Array, ...],
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     jax.Array,
     jax.Array,
-    tuple[jax.Array, ...],
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     jax.Array,
     jax.Array,
-    tuple[jax.Array, ...],
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
 ]:
     """
     Split dataset into train/val/test along the batch dimension.
@@ -97,26 +103,47 @@ def split_train_val_test(
     """
     batch_count = solution.shape[0]
 
-    # Base sizes
-    train_size = max(1, int(train_fraction * batch_count))
-    # Ensure validation size does not exceed remaining after train
-    tentative_val = int(val_fraction * batch_count)
-    val_size = max(0, min(tentative_val, batch_count - train_size))
+    # Enforce all three fractions; adjust last slice to absorb rounding
+    assert 0.0 <= train_fraction <= 1.0
+    assert 0.0 <= val_fraction <= 1.0
+    assert 0.0 <= test_fraction <= 1.0
+    # Normalize if they don't sum to 1.0 to honor intent
+    total = train_fraction * 1.0 + val_fraction * 1.0 + test_fraction * 1.0
+    if total <= 0:
+        raise ValueError("At least one split fraction must be positive.")
+    if abs(total - 1.0) > 1e-6:
+        train_fraction = train_fraction / total
+        val_fraction = val_fraction / total
+        test_fraction = test_fraction / total
+
+    train_size = int(round(train_fraction * batch_count))
+    val_size = int(round(val_fraction * batch_count))
+    # Ensure we don't exceed total; assign remainder to test
+    train_size = max(0, min(train_size, batch_count))
+    val_size = max(0, min(val_size, max(0, batch_count - train_size)))
     test_size = max(0, batch_count - train_size - val_size)
 
     ts_train = ts_batched[:train_size]
     target_train = solution[:train_size]
-    coeffs_train = tuple(c[:train_size] for c in coeffs_batched)
+    a, b, c, d = coeffs_batched
+    coeffs_train = (a[:train_size], b[:train_size], c[:train_size], d[:train_size])
 
     ts_val = ts_batched[train_size : train_size + val_size]
     target_val = solution[train_size : train_size + val_size]
-    coeffs_val = tuple(c[train_size : train_size + val_size] for c in coeffs_batched)
+    coeffs_val = (
+        a[train_size : train_size + val_size],
+        b[train_size : train_size + val_size],
+        c[train_size : train_size + val_size],
+        d[train_size : train_size + val_size],
+    )
 
     ts_test = ts_batched[train_size + val_size : train_size + val_size + test_size]
     target_test = solution[train_size + val_size : train_size + val_size + test_size]
-    coeffs_test = tuple(
-        c[train_size + val_size : train_size + val_size + test_size]
-        for c in coeffs_batched
+    coeffs_test = (
+        a[train_size + val_size : train_size + val_size + test_size],
+        b[train_size + val_size : train_size + val_size + test_size],
+        c[train_size + val_size : train_size + val_size + test_size],
+        d[train_size + val_size : train_size + val_size + test_size],
     )
 
     return (
@@ -133,27 +160,29 @@ def split_train_val_test(
 
 
 def make_dataloader(
-    arrays: tuple[jax.Array, jax.Array, tuple[jax.Array, ...]],
+    timestep: jax.Array,
+    solution: jax.Array,
+    drivers: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     batch_size: int,
     *,
     key: jax.Array,
 ):
     """
-    Simple shuffled minibatch generator yielding (ts_batch, target_batch, coeffs_batch).
-    - ts_batch: shape (B, T)
-    - target_batch: shape (B, T, C)
-    - coeffs_batch: tuple of arrays, each shape (B, T, data_channels)
+    Simple shuffled minibatch generator yielding (timestep_b, solution_b, drivers_b).
+    - timestep_b: shape (B, T)
+    - solution_b: shape (B, T, C)
+    - drivers_b: tuple of arrays, each shape (B, T, data_channels)
     """
-    ts_all, target_all, coeffs_all = arrays
-    dataset_size = target_all.shape[0]
+    dataset_size = solution.shape[0]
     indices = jnp.arange(dataset_size)
+    a, b, c, d = drivers
     while True:
         perm = jax.random.permutation(key, indices)
         (key,) = jr.split(key, 1)
         for start in range(0, dataset_size, batch_size):
             end = min(start + batch_size, dataset_size)
             batch_idx = perm[start:end]
-            ts_b = ts_all[batch_idx]
-            target_b = target_all[batch_idx]
-            coeffs_b = tuple(c[batch_idx] for c in coeffs_all)
-            yield ts_b, target_b, coeffs_b
+            ts_b = timestep[batch_idx]
+            sol_b = solution[batch_idx]
+            drv_b = (a[batch_idx], b[batch_idx], c[batch_idx], d[batch_idx])
+            yield ts_b, sol_b, drv_b

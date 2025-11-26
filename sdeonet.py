@@ -64,7 +64,6 @@ def haar_basis_matrix(J: int, T: float, t: jax.Array) -> jax.Array:
     The first basis is the constant scaling function 1/sqrt(T).
     Subsequent entries follow the standard Haar wavelets with normalization.
     """
-    Tsteps = t.shape[0]
     Phi_list: list[jax.Array] = []
     Phi_list.append(jnp.ones_like(t) / math.sqrt(float(T)))
     level = 0
@@ -102,8 +101,11 @@ def hermite_polynomials_orthonormal_1d(xi: jax.Array, M: int) -> jax.Array:
         prev = carry
         hm1 = prev[..., m - 1]
         hm2 = prev[..., m - 2]
-        val = xi * hm1 - (m - 1) * hm2
-        val = val / math.sqrt(math.factorial(m))
+        # Normalized probabilists' Hermite recurrence:
+        # h_m = (xi * h_{m-1} - sqrt(m-1) * h_{m-2}) / sqrt(m)
+        sqrt_m = jnp.sqrt(jnp.asarray(m, dtype=xi.dtype))
+        sqrt_m_minus_1 = jnp.sqrt(jnp.asarray(m - 1, dtype=xi.dtype))
+        val = (xi * hm1 - sqrt_m_minus_1 * hm2) / sqrt_m
         return prev.at[..., m].set(val)
 
     H = jax.lax.fori_loop(2, M + 1, body, H) if M >= 2 else H
@@ -275,8 +277,7 @@ class SDEONet(eqx.Module):
         return pe
 
     def _ito_left_projection(self, W: jax.Array, t_grid: jax.Array) -> jax.Array:
-        B, Tsteps = W.shape
-        dW = W[:, 1:] - W[:, :-1]  # (B, N)
+        dW = W[1:] - W[:-1]  # (B, N)
         Phi = haar_basis_matrix(self.J, self.T, t_grid)  # (J, Tsteps)
         coef = Phi[:, :-1]  # (J, N) left endpoints
         xi = dW @ coef.T  # (B, J)

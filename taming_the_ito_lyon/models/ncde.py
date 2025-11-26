@@ -6,6 +6,7 @@ https://docs.kidger.site/diffrax/examples/neural_cde/
 
 import equinox as eqx
 import jax
+import jax.typing as jtp
 import jax.nn as jnn
 import jax.random as jr
 import diffrax
@@ -45,7 +46,7 @@ class CDEFunc(eqx.Module):
             key=key,
         )
 
-    def __call__(self, t: float, y: jax.Array, args: None) -> jax.Array:
+    def __call__(self, t: jtp.ArrayLike, y: jax.Array, args: None) -> jax.Array:
         del t, args
         out = self.mlp(y)
         return out.reshape(self.hidden_size, self.data_size)
@@ -115,7 +116,7 @@ class NeuralCDE(eqx.Module):
         self.rtol = rtol
         self.atol = atol
         self.dtmin = dtmin
-        self.evolving_out = bool(evolving_out)
+        self.evolving_out = evolving_out
 
     def _solve(
         self,
@@ -139,6 +140,7 @@ class NeuralCDE(eqx.Module):
             stepsize_controller=stepsize_controller,
             saveat=saveat,
         )
+        assert solution.ys is not None
         if self.evolving_out:
             return solution.ys
         return solution.ys[-1]
@@ -146,7 +148,7 @@ class NeuralCDE(eqx.Module):
     def __call__(
         self,
         ts: jax.Array,
-        control_or_coeffs: diffrax.AbstractPath | tuple[jax.Array, ...],
+        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     ) -> jax.Array:
         """
         Forward pass.
@@ -160,10 +162,7 @@ class NeuralCDE(eqx.Module):
         - If self.evolving_out is False: shape (out_size,)
         - If self.evolving_out is True: shape (T, out_size)
         """
-        if isinstance(control_or_coeffs, diffrax.AbstractPath):
-            control = control_or_coeffs
-        else:
-            control = diffrax.CubicInterpolation(ts, control_or_coeffs)
+        control = diffrax.CubicInterpolation(ts, coeffs)
 
         hidden_states = self._solve(ts, control)
 

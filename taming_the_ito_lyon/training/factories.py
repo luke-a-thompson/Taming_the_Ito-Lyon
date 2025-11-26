@@ -5,9 +5,8 @@ from taming_the_ito_lyon.config import (
     Config,
     NCDEConfig,
     NRDEConfig,
-    SDEONetConfig,
 )
-from taming_the_ito_lyon.models import NeuralCDE, NeuralRDE, SDEONet
+from taming_the_ito_lyon.models import NeuralCDE, NeuralRDE
 from taming_the_ito_lyon.config import DATASETS
 from taming_the_ito_lyon.data.datasets import prepare_dataset
 
@@ -18,7 +17,7 @@ def create_model(
     input_path_dim: int,
     output_path_dim: int,
     key: jax.Array,
-) -> NeuralCDE | NeuralRDE | SDEONet:
+) -> NeuralCDE | NeuralRDE:
     match config.nn_config:
         case NCDEConfig():
             return NeuralCDE(
@@ -43,24 +42,24 @@ def create_model(
                 signature_window_size=int(config.nn_config.signature_window_size),
                 key=key,
             )
-        case SDEONetConfig():
-            return SDEONet(
-                basis_in_dim=config.nn_config.basis_in_dim,
-                basis_out_dim=config.nn_config.basis_out_dim,
-                T=config.nn_config.T,
-                hermite_M=config.nn_config.hermite_M,
-                wick_order=config.nn_config.wick_order,
-                use_posenc=config.nn_config.use_posenc,
-                pe_dim=config.nn_config.pe_dim,
-                include_raw_time=config.nn_config.include_raw_time,
-                branch_width=config.nn_config.branch_width,
-                branch_depth=config.nn_config.branch_depth,
-                trunk_width=config.nn_config.trunk_width,
-                trunk_depth=config.nn_config.trunk_depth,
-                use_layernorm=config.nn_config.use_layernorm,
-                residual=config.nn_config.residual,
-                key=key,
-            )
+        # case SDEONetConfig():
+        #     return SDEONet(
+        #         basis_in_dim=config.nn_config.basis_in_dim,
+        #         basis_out_dim=config.nn_config.basis_out_dim,
+        #         T=config.nn_config.T,
+        #         hermite_M=config.nn_config.hermite_M,
+        #         wick_order=config.nn_config.wick_order,
+        #         use_posenc=config.nn_config.use_posenc,
+        #         pe_dim=config.nn_config.pe_dim,
+        #         include_raw_time=config.nn_config.include_raw_time,
+        #         branch_width=config.nn_config.branch_width,
+        #         branch_depth=config.nn_config.branch_depth,
+        #         trunk_width=config.nn_config.trunk_width,
+        #         trunk_depth=config.nn_config.trunk_depth,
+        #         use_layernorm=config.nn_config.use_layernorm,
+        #         residual=config.nn_config.residual,
+        #         key=key,
+        #     )
         case _:
             raise ValueError(f"Unknown model: {config.model_config}")
 
@@ -83,7 +82,7 @@ def create_optimizer(
 
 def create_dataset(
     config: Config, *, key: jax.Array
-) -> tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
+) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """
     Create dataset arrays from configuration.
 

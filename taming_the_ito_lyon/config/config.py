@@ -1,5 +1,5 @@
 import tomllib
-from pydantic import BaseModel, Field, PositiveInt, PositiveFloat
+from pydantic import BaseModel, Field, PositiveInt, PositiveFloat, model_validator
 from taming_the_ito_lyon.config import Optimizer
 
 
@@ -10,6 +10,25 @@ class ExperimentConfig(BaseModel):
     dataset_name: str = Field(
         description="Dataset name key from config_options.DATASETS"
     )
+
+    train_fraction: PositiveFloat = Field(
+        default=0.6, le=1.0, description="Fraction of data for training"
+    )
+    val_fraction: PositiveFloat = Field(
+        default=0.2, le=1.0, description="Fraction of data for validation"
+    )
+    test_fraction: PositiveFloat = Field(
+        default=0.2, le=1.0, description="Fraction of data for testing"
+    )
+
+    @model_validator(mode="after")
+    def validate_fractions_sum(self) -> "ExperimentConfig":
+        total = self.train_fraction + self.val_fraction + self.test_fraction
+        if total > 1.0:
+            raise ValueError(
+                f"Sum of train, val, and test fractions ({total:.4f}) cannot exceed 1.0"
+            )
+        return self
 
     # Optimizer
     optimizer: Optimizer = Field(description="Optimizer name")
