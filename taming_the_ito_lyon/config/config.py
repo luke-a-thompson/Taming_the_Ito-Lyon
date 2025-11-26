@@ -44,9 +44,6 @@ class ExperimentConfig(BaseModel):
     early_stopping_patience: PositiveInt = Field(
         default=25, description="Epochs with no val improvement before stopping"
     )
-    checkpoint_path: str = Field(
-        default="checkpoints/best.eqx", description="File path to save best model"
-    )
 
 
 class NCDEConfig(BaseModel):

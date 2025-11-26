@@ -12,4 +12,4 @@ wheels/
 # Project-specific
 /jax_cache/
 /data/
-/checkpoints/
+/saved_models/

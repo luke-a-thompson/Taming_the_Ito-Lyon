@@ -14,7 +14,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_toml_config(args.config)
-    experiment(config)
+    experiment(config, config_path=args.config)
 
 
 if __name__ == "__main__":
