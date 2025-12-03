@@ -49,7 +49,7 @@ def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
 
 
 def prepare_dataset(
-    npz_path: str, *, key: jax.Array
+    npz_path: str,
 ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """
     Load dataset and precompute cubic coefficients with time channel.
@@ -59,7 +59,6 @@ def prepare_dataset(
     - solution: shape (B, T, C)
     - coeffs_batched: tuple of arrays each shape (B, T, data_channels)
     """
-    del key  # key kept for future stochastic data transforms
     solution, driver = load_npz_dataset(npz_path)
     tqdm.write(
         (
@@ -102,11 +101,6 @@ def split_train_val_test(
     Returns (ts_train, target_train, coeffs_train, ts_val, target_val, coeffs_val, ts_test, target_test, coeffs_test).
     """
     batch_count = solution.shape[0]
-
-    # Enforce all three fractions; adjust last slice to absorb rounding
-    assert 0.0 <= train_fraction <= 1.0
-    assert 0.0 <= val_fraction <= 1.0
-    assert 0.0 <= test_fraction <= 1.0
     # Normalize if they don't sum to 1.0 to honor intent
     total = train_fraction * 1.0 + val_fraction * 1.0 + test_fraction * 1.0
     if total <= 0:
