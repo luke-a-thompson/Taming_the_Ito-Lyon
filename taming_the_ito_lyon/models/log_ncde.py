@@ -1,4 +1,6 @@
-from __future__ import annotations
+"""
+A reimplementation of Log-NCDE using Jax and Stochastax (https://arxiv.org/abs/2402.18512).
+"""
 
 from collections.abc import Callable
 

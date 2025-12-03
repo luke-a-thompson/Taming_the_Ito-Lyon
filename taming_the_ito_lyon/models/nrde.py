@@ -1,9 +1,5 @@
 """
-Neural Rough Differential Equation (log-ODE/NRDE) model in JAX.
-
-This mirrors the style and call signature of `ncde.py` but performs a
-discrete log-ODE update using per-interval log-signatures computed via
-`quicksig`.
+A reimplementation of Neural Rough Differential Equations (NRDE) using Jax and Stochastax (https://arxiv.org/abs/2009.08295).
 """
 
 import equinox as eqx
