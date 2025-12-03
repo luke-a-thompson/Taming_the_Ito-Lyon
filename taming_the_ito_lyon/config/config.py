@@ -1,10 +1,13 @@
 import tomllib
 from pydantic import BaseModel, Field, PositiveInt, PositiveFloat, model_validator
-from taming_the_ito_lyon.config import Optimizer
+from taming_the_ito_lyon.config import Optimizer, ModelType
 
 
 class ExperimentConfig(BaseModel):
     """Aggregated non-model experiment configuration."""
+
+    # Model selection
+    model_type: ModelType = Field(description="Which model architecture to use")
 
     # Dataset
     dataset_name: str = Field(
@@ -50,8 +53,8 @@ class NCDEConfig(BaseModel):
     """Top-level NCDE configuration composed of model params."""
 
     # Model params
-    hidden_size: PositiveInt = Field(description="Hidden state dimension")
-    width_size: PositiveInt = Field(description="MLP width")
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
     depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
@@ -65,8 +68,26 @@ class NRDEConfig(BaseModel):
     """Top-level NRDE configuration composed of model params."""
 
     # Model params
-    hidden_size: PositiveInt = Field(description="Hidden state dimension")
-    width_size: PositiveInt = Field(description="MLP width")
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
+    depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
+    out_size: PositiveInt = Field(description="Output channels predicted by readout")
+
+    # Signature config
+    signature_depth: PositiveInt = Field(le=5, description="Signature depth")
+
+    # Log-signature window size in data steps (polyline uses window_size+1 points)
+    signature_window_size: PositiveInt = Field(
+        default=1, description="Data steps per log-signature window"
+    )
+
+
+class LogNCDEConfig(BaseModel):
+    """Top-level Log-NCDE configuration composed of model params."""
+
+    # Model params
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
     depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
@@ -109,7 +130,61 @@ class SDEONetConfig(BaseModel):
 
 class Config(BaseModel):
     experiment_config: ExperimentConfig
-    nn_config: NCDEConfig | NRDEConfig | SDEONetConfig
+    ncde_config: NCDEConfig | None = None
+    log_ncde_config: LogNCDEConfig | None = None
+    nrde_config: NRDEConfig | None = None
+    sdeonet_config: SDEONetConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_model_config_exists(self) -> "Config":
+        """Ensure the correct config section exists for the chosen model_type."""
+        model_type = self.experiment_config.model_type
+
+        config_map = {
+            ModelType.NCDE: self.ncde_config,
+            ModelType.LOG_NCDE: self.log_ncde_config,
+            ModelType.NRDE: self.nrde_config,
+            ModelType.SDEONET: self.sdeonet_config,
+        }
+
+        active_config = config_map.get(model_type)
+        if active_config is None:
+            raise ValueError(
+                f"Model type '{model_type}' requires a '{model_type}_config' section in the TOML"
+            )
+
+        # Ensure no extra configs are provided
+        all_configs = [
+            self.ncde_config,
+            self.log_ncde_config,
+            self.nrde_config,
+            self.sdeonet_config,
+        ]
+        num_provided = sum(c is not None for c in all_configs)
+        if num_provided > 1:
+            raise ValueError("Only one model config section should be provided")
+
+        return self
+
+    @property
+    def nn_config(self) -> NCDEConfig | LogNCDEConfig | NRDEConfig | SDEONetConfig:
+        """Get the active model configuration based on model_type."""
+        model_type = self.experiment_config.model_type
+
+        if model_type == ModelType.NCDE:
+            assert self.ncde_config is not None
+            return self.ncde_config
+        elif model_type == ModelType.LOG_NCDE:
+            assert self.log_ncde_config is not None
+            return self.log_ncde_config
+        elif model_type == ModelType.NRDE:
+            assert self.nrde_config is not None
+            return self.nrde_config
+        elif model_type == ModelType.SDEONET:
+            assert self.sdeonet_config is not None
+            return self.sdeonet_config
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
 
 
 def load_toml_config(toml_path: str) -> Config:

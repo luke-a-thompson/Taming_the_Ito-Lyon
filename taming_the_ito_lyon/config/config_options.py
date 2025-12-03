@@ -10,9 +10,11 @@ DATASETS = {
 }
 
 
-class Model(StrEnum):
-    NCDE = "NeuralCDE"
-    NRDE = "NeuralRDE"
+class ModelType(StrEnum):
+    NCDE = "ncde"
+    LOG_NCDE = "log_ncde"
+    NRDE = "nrde"
+    SDEONET = "sdeonet"
 
 
 class Optimizer(StrEnum):
