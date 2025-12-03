@@ -1,17 +1,17 @@
 [experiment_config]
-model_type = "nrde"
+model_type = "log_ncde"
 dataset_name = "ou_process"
 optimizer = "adam"
 learning_rate = 0.001
 weight_decay = 0.000001
 seed = 1
-batch_size = 64
+batch_size = 96
 epochs = 200
 
-[nrde_config]
+[log_ncde_config]
 
-# NRDE model parameters
-cde_state_dim = 16
+# Log-NCDE model parameters
+cde_state_dim = 16 # Jacobian burden, quadratic in this
 vf_hidden_dim = 32
 depth = 3
 out_size = 1

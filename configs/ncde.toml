@@ -1,4 +1,5 @@
 [experiment_config]
+model_type = "ncde"
 dataset_name = "ou_process"
 optimizer = "adam"
 learning_rate = 0.001
@@ -7,11 +8,12 @@ seed = 1
 batch_size = 128
 epochs = 200
 
-[nn_config]
+[ncde_config]
+
 # NCDE model parameters
-hidden_size = 64
-width_size = 64
-depth = 2
+cde_state_dim = 64
+vf_hidden_dim = 64
+depth = 3
 out_size = 1
 
 # Solver tolerances

@@ -1,4 +1,5 @@
 [experiment_config]
+model_type = "sdeonet"
 dataset_name = "ou_process"
 optimizer = "adam"
 learning_rate = 0.001
@@ -7,7 +8,8 @@ seed = 1
 batch_size = 128
 epochs = 200
 
-[nn_config]
+[sdeonet_config]
+
 # SDEONet model parameters
 basis_in_dim = 64
 basis_out_dim = 96
