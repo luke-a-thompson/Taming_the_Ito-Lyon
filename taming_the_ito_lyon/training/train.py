@@ -31,6 +31,9 @@ def _jitted_batch_mse_loss(
     return batch_mse_loss(model, ts_b, target_b, coeffs_b)
 
 
+grad_fn = eqx.filter_value_and_grad(batch_mse_loss)
+
+
 def eval_epoch(
     model: Model,
     timestep_b: jax.Array,
@@ -47,8 +50,6 @@ def train_epoch(
     loader,
     num_batches: int,
 ) -> tuple[float, Model, optax.OptState]:
-    grad_fn = eqx.filter_value_and_grad(batch_mse_loss)
-
     @eqx.filter_jit(donate="all")
     def step(
         timestep_b: jax.Array,
