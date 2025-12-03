@@ -4,9 +4,10 @@ from taming_the_ito_lyon.config import (
     Optimizer,
     Config,
     NCDEConfig,
+    LogNCDEConfig,
     NRDEConfig,
 )
-from taming_the_ito_lyon.models import NeuralCDE, NeuralRDE
+from taming_the_ito_lyon.models import NeuralCDE, LogNCDE, NeuralRDE
 from taming_the_ito_lyon.config import DATASETS
 from taming_the_ito_lyon.data.datasets import prepare_dataset
 
@@ -17,13 +18,13 @@ def create_model(
     input_path_dim: int,
     output_path_dim: int,
     key: jax.Array,
-) -> NeuralCDE | NeuralRDE:
+) -> NeuralCDE | LogNCDE | NeuralRDE:
     match config.nn_config:
         case NCDEConfig():
             return NeuralCDE(
                 input_path_dim=input_path_dim,
-                hidden_size=config.nn_config.hidden_size,
-                width_size=config.nn_config.width_size,
+                cde_state_dim=config.nn_config.cde_state_dim,
+                vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 depth=config.nn_config.depth,
                 output_path_dim=output_path_dim,
                 key=key,
@@ -31,11 +32,22 @@ def create_model(
                 atol=config.nn_config.atol,
                 dtmin=config.nn_config.dtmin,
             )
+        case LogNCDEConfig():
+            return LogNCDE(
+                input_path_dim=input_path_dim,
+                cde_state_dim=config.nn_config.cde_state_dim,
+                vf_hidden_dim=config.nn_config.vf_hidden_dim,
+                depth=config.nn_config.depth,
+                output_path_dim=output_path_dim,
+                signature_depth=config.nn_config.signature_depth,
+                signature_window_size=int(config.nn_config.signature_window_size),
+                key=key,
+            )
         case NRDEConfig():
             return NeuralRDE(
                 input_path_dim=input_path_dim,
-                hidden_size=config.nn_config.hidden_size,
-                width_size=config.nn_config.width_size,
+                cde_state_dim=config.nn_config.cde_state_dim,
+                vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 depth=config.nn_config.depth,
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
@@ -75,13 +87,15 @@ def create_optimizer(
         case Optimizer.ADAMW:
             return optax.adamw(learning_rate, weight_decay=weight_decay)
         case Optimizer.MUON:
-            raise NotImplementedError("Muon optimizer not implemented")
+            return optax.contrib.muon(
+                learning_rate=learning_rate, weight_decay=weight_decay
+            )
         case _:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
 
 def create_dataset(
-    config: Config, *, key: jax.Array
+    config: Config,
 ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """
     Create dataset arrays from configuration.
@@ -94,5 +108,5 @@ def create_dataset(
             f"Unknown dataset name '{dataset_name}'. Available: {list(DATASETS.keys())}"
         )
     npz_path = DATASETS[dataset_name]["npz_path"]
-    ts_batched, solution, coeffs_batched = prepare_dataset(npz_path, key=key)
+    ts_batched, solution, coeffs_batched = prepare_dataset(npz_path)
     return ts_batched, solution, coeffs_batched
