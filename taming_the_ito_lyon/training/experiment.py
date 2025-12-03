@@ -20,7 +20,13 @@ from taming_the_ito_lyon.data import (
     split_train_val_test,
     make_dataloader,
 )
-from taming_the_ito_lyon.config import Config, NCDEConfig, NRDEConfig, SDEONetConfig
+from taming_the_ito_lyon.config import (
+    Config,
+    NCDEConfig,
+    LogNCDEConfig,
+    NRDEConfig,
+    SDEONetConfig,
+)
 from taming_the_ito_lyon.models import Model
 
 SAVED_MODELS_DIR = "saved_models"
@@ -31,6 +37,8 @@ def _get_model_name(config: Config) -> str:
     match config.nn_config:
         case NCDEConfig():
             return "ncde"
+        case LogNCDEConfig():
+            return "log_ncde"
         case NRDEConfig():
             return "nrde"
         case SDEONetConfig():
@@ -50,9 +58,9 @@ def _get_run_dirname(model_name: str) -> str:
 def experiment(config: Config, config_path: str | None = None) -> None:
     model_name = _get_model_name(config)
     key = jr.PRNGKey(config.experiment_config.seed)
-    model_key, data_key, loader_key = jr.split(key, 3)
+    model_key, loader_key = jr.split(key, 2)
 
-    ts_batched, solution, coeffs_batched = create_dataset(config=config, key=data_key)
+    ts_batched, solution, coeffs_batched = create_dataset(config=config)
     batch_count, length, target_channels = solution.shape
     data_channels = int(coeffs_batched[0].shape[-1])
 
