@@ -17,29 +17,29 @@ class CDEFunc(eqx.Module):
     """
     Vector field for a Neural CDE.
 
-    Given hidden state y in R^{hidden_size}, returns matrix in R^{hidden_size x data_size}
-    which is multiplied against dx/dt.
+    Given hidden state y in R^{cde_state_dim}, returns matrix in
+    R^{cde_state_dim x data_size} which is multiplied against dx/dt.
     """
 
     mlp: eqx.nn.MLP
     data_size: int
-    hidden_size: int
+    cde_state_dim: int
 
     def __init__(
         self,
         data_size: int,
-        hidden_size: int,
-        width_size: int,
+        cde_state_dim: int,
+        vf_hidden_dim: int,
         depth: int,
         *,
         key: jax.Array,
     ) -> None:
         self.data_size = data_size
-        self.hidden_size = hidden_size
+        self.cde_state_dim = cde_state_dim
         self.mlp = eqx.nn.MLP(
-            in_size=hidden_size,
-            out_size=hidden_size * data_size,
-            width_size=width_size,
+            in_size=cde_state_dim,
+            out_size=cde_state_dim * data_size,
+            width_size=vf_hidden_dim,
             depth=depth,
             activation=jnn.softplus,
             final_activation=jnn.tanh,
@@ -49,7 +49,7 @@ class CDEFunc(eqx.Module):
     def __call__(self, t: jtp.ArrayLike, y: jax.Array, args: None) -> jax.Array:
         del t, args
         out = self.mlp(y)
-        return out.reshape(self.hidden_size, self.data_size)
+        return out.reshape(self.cde_state_dim, self.data_size)
 
 
 class NeuralCDE(eqx.Module):
@@ -76,9 +76,9 @@ class NeuralCDE(eqx.Module):
     def __init__(
         self,
         input_path_dim: int,
-        hidden_size: int,
+        cde_state_dim: int,
         output_path_dim: int,
-        width_size: int,
+        vf_hidden_dim: int,
         depth: int,
         *,
         key: jax.Array,
@@ -91,21 +91,21 @@ class NeuralCDE(eqx.Module):
         k1, k2, k3 = jr.split(key, 3)
         self.initial = eqx.nn.MLP(
             in_size=input_path_dim,
-            out_size=hidden_size,
-            width_size=width_size,
+            out_size=cde_state_dim,
+            width_size=vf_hidden_dim,
             depth=depth,
             activation=jnn.softplus,
             key=k1,
         )
         self.func = CDEFunc(
             data_size=input_path_dim,
-            hidden_size=hidden_size,
-            width_size=width_size,
+            cde_state_dim=cde_state_dim,
+            vf_hidden_dim=vf_hidden_dim,
             depth=depth,
             key=k2,
         )
         self.readout = eqx.nn.Linear(
-            in_features=hidden_size,
+            in_features=cde_state_dim,
             out_features=output_path_dim,
             use_bias=True,
             key=k3,
