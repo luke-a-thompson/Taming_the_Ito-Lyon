@@ -22,29 +22,10 @@ from taming_the_ito_lyon.data import (
 )
 from taming_the_ito_lyon.config import (
     Config,
-    NCDEConfig,
-    LogNCDEConfig,
-    NRDEConfig,
-    SDEONetConfig,
 )
 from taming_the_ito_lyon.models import Model
 
 SAVED_MODELS_DIR = "saved_models"
-
-
-def _get_model_name(config: Config) -> str:
-    """Get model name from config type."""
-    match config.nn_config:
-        case NCDEConfig():
-            return "ncde"
-        case LogNCDEConfig():
-            return "log_ncde"
-        case NRDEConfig():
-            return "nrde"
-        case SDEONetConfig():
-            return "sdeonet"
-        case _:
-            return "model"
 
 
 def _get_run_dirname(model_name: str) -> str:
@@ -56,7 +37,7 @@ def _get_run_dirname(model_name: str) -> str:
 
 
 def experiment(config: Config, config_path: str | None = None) -> None:
-    model_name = _get_model_name(config)
+    model_name = config.experiment_config.model_type.value
     key = jr.PRNGKey(config.experiment_config.seed)
     model_key, loader_key = jr.split(key, 2)
 
