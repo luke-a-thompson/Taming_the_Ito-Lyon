@@ -5,16 +5,19 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "jax[cuda]>=0.8.1",
     "diffrax>=0.7.0",
     "equinox>=0.13.2",
-    "jax[cuda]>=0.8.0",
     "optax>=0.2.6",
     "numpy>=2.0.0",
     "pydantic>=2.12.3",
     "tqdm>=4.67.1",
-    "quicksig @ git+https://github.com/luke-a-thompson/QuickSig.git@master",
+    "stochastax",
     "mypy>=1.18.2",
 ]
+
+[tool.uv.sources]
+stochastax = { git = "https://github.com/luke-a-thompson/Stochastax.git", branch = "master" }
 
 [project.scripts]
 train = "taming_the_ito_lyon.training.train_cli:main"
