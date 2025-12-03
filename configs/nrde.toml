@@ -13,7 +13,8 @@ epochs = 200
 # NRDE model parameters
 cde_state_dim = 16
 vf_hidden_dim = 32
-depth = 3
+initial_cond_mlp_depth = 2
+vf_mlp_depth = 3
 out_size = 1
 
 # Log-signature configuration

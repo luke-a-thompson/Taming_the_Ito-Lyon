@@ -25,7 +25,8 @@ def create_model(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
-                depth=config.nn_config.depth,
+                initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                vf_mlp_depth=config.nn_config.vf_mlp_depth,
                 output_path_dim=output_path_dim,
                 key=key,
                 rtol=config.nn_config.rtol,
@@ -37,10 +38,11 @@ def create_model(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
-                depth=config.nn_config.depth,
+                initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                vf_mlp_depth=config.nn_config.vf_mlp_depth,
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
-                signature_window_size=int(config.nn_config.signature_window_size),
+                signature_window_size=config.nn_config.signature_window_size,
                 key=key,
             )
         case NRDEConfig():
@@ -48,10 +50,11 @@ def create_model(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
-                depth=config.nn_config.depth,
+                initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                vf_mlp_depth=config.nn_config.vf_mlp_depth,
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
-                signature_window_size=int(config.nn_config.signature_window_size),
+                signature_window_size=config.nn_config.signature_window_size,
                 key=key,
             )
         # case SDEONetConfig():

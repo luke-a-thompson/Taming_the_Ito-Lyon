@@ -25,25 +25,28 @@ class NRDEFunc(eqx.Module):
     """
 
     mlp: eqx.nn.MLP
-    logsig_size: int
     cde_state_dim: int
+    logsig_size: int
 
     def __init__(
         self,
         *,
+        input_path_dim: int,
         cde_state_dim: int,
-        logsig_size: int,
         vf_hidden_dim: int,
-        depth: int,
+        vf_mlp_depth: int,
+        signature_depth: int,
         key: jax.Array,
     ) -> None:
-        self.logsig_size = logsig_size
         self.cde_state_dim = cde_state_dim
+        self.logsig_size = int(
+            get_log_signature_dim(depth=signature_depth, dim=input_path_dim)
+        )
         self.mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
-            out_size=cde_state_dim * logsig_size,
+            out_size=cde_state_dim * self.logsig_size,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=vf_mlp_depth,
             activation=jnn.softplus,
             final_activation=jnn.tanh,
             key=key,
@@ -81,10 +84,11 @@ class NeuralRDE(eqx.Module):
         cde_state_dim: int,
         output_path_dim: int,
         vf_hidden_dim: int,
-        depth: int,
+        initial_cond_mlp_depth: int,
+        vf_mlp_depth: int,
         *,
         signature_depth: int,
-        signature_window_size: int = 1,
+        signature_window_size: int,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] | None = None,
         evolving_out: bool = True,
@@ -95,19 +99,16 @@ class NeuralRDE(eqx.Module):
             in_size=input_path_dim,
             out_size=cde_state_dim,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,
         )
-
-        logsig_size = int(
-            get_log_signature_dim(depth=signature_depth, dim=input_path_dim)
-        )
         self.func = NRDEFunc(
+            input_path_dim=input_path_dim,
             cde_state_dim=cde_state_dim,
-            logsig_size=logsig_size,
             vf_hidden_dim=vf_hidden_dim,
-            depth=depth,
+            vf_mlp_depth=vf_mlp_depth,
+            signature_depth=signature_depth,
             key=k2,
         )
         self.readout = eqx.nn.Linear(

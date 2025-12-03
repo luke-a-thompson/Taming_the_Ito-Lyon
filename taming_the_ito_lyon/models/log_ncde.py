@@ -11,7 +11,6 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
 
-from stochastax.analytics import get_log_signature_dim
 from stochastax.integrators import log_ode
 from stochastax.vector_field_lifts import form_lyndon_lift
 from stochastax.vector_field_lifts.split_vector_fields import split_multi_vector_field
@@ -29,19 +28,19 @@ class LogNCDEFunc(eqx.Module):
     primitive log-signature on each interval.
     """
 
+    input_path_dim: int
     base_mlp: eqx.nn.MLP
     signature_depth: int
-    input_path_dim: int
     cde_state_dim: int
     shuffle_hopf_algebra: ShuffleHopfAlgebra = eqx.field(static=True)
 
     def __init__(
         self,
         *,
-        cde_state_dim: int,
         input_path_dim: int,
+        cde_state_dim: int,
         vf_hidden_dim: int,
-        depth: int,
+        vf_mlp_depth: int,
         signature_depth: int,
         key: jax.Array,
     ) -> None:
@@ -55,7 +54,7 @@ class LogNCDEFunc(eqx.Module):
             in_size=cde_state_dim,
             out_size=input_path_dim * cde_state_dim,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=vf_mlp_depth,
             activation=jnn.softplus,
             final_activation=jnn.tanh,
             key=key,
@@ -82,7 +81,6 @@ class LogNCDE(eqx.Module):
     signature_depth: int = eqx.field(static=True)
     signature_window_size: int = eqx.field(static=True)
     evolving_out: bool
-    logsig_size: int
 
     def __init__(
         self,
@@ -90,10 +88,11 @@ class LogNCDE(eqx.Module):
         cde_state_dim: int,
         output_path_dim: int,
         vf_hidden_dim: int,
-        depth: int,
+        initial_cond_mlp_depth: int,
+        vf_mlp_depth: int,
         *,
         signature_depth: int,
-        signature_window_size: int = 1,
+        signature_window_size: int,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] | None = None,
         evolving_out: bool = True,
@@ -103,16 +102,16 @@ class LogNCDE(eqx.Module):
             in_size=input_path_dim,
             out_size=cde_state_dim,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,
         )
         self.cde_func = LogNCDEFunc(
-            cde_state_dim=cde_state_dim,
             input_path_dim=input_path_dim,
+            cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
-            depth=depth,
-            signature_depth=int(signature_depth),
+            vf_mlp_depth=vf_mlp_depth,
+            signature_depth=signature_depth,
             key=k2,
         )
         self.readout = eqx.nn.Linear(
@@ -121,13 +120,12 @@ class LogNCDE(eqx.Module):
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = readout_activation or (lambda x: x)
-        self.signature_depth = int(signature_depth)
-        self.signature_window_size = int(signature_window_size)
-        self.evolving_out = bool(evolving_out)
-        self.logsig_size = int(
-            get_log_signature_dim(depth=self.signature_depth, dim=input_path_dim)
+        self.readout_activation = (
+            readout_activation if readout_activation is not None else (lambda x: x)
         )
+        self.signature_depth = signature_depth
+        self.signature_window_size = signature_window_size
+        self.evolving_out = evolving_out
 
     def _rollout_hidden(self, h0: jax.Array, logsigs: object) -> jax.Array:
         """Roll out hidden state over time using a scanned loop."""

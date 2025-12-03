@@ -22,25 +22,25 @@ class CDEFunc(eqx.Module):
     """
 
     mlp: eqx.nn.MLP
-    data_size: int
+    input_path_dim: int
     cde_state_dim: int
 
     def __init__(
         self,
-        data_size: int,
+        input_path_dim: int,
         cde_state_dim: int,
         vf_hidden_dim: int,
-        depth: int,
+        vf_mlp_depth: int,
         *,
         key: jax.Array,
     ) -> None:
-        self.data_size = data_size
+        self.input_path_dim = input_path_dim
         self.cde_state_dim = cde_state_dim
         self.mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
-            out_size=cde_state_dim * data_size,
+            out_size=cde_state_dim * input_path_dim,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=vf_mlp_depth,
             activation=jnn.softplus,
             final_activation=jnn.tanh,
             key=key,
@@ -49,7 +49,7 @@ class CDEFunc(eqx.Module):
     def __call__(self, t: jtp.ArrayLike, y: jax.Array, args: None) -> jax.Array:
         del t, args
         out = self.mlp(y)
-        return out.reshape(self.cde_state_dim, self.data_size)
+        return out.reshape(self.cde_state_dim, self.input_path_dim)
 
 
 class NeuralCDE(eqx.Module):
@@ -79,7 +79,8 @@ class NeuralCDE(eqx.Module):
         cde_state_dim: int,
         output_path_dim: int,
         vf_hidden_dim: int,
-        depth: int,
+        initial_cond_mlp_depth: int,
+        vf_mlp_depth: int,
         *,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] | None = None,
@@ -93,15 +94,15 @@ class NeuralCDE(eqx.Module):
             in_size=input_path_dim,
             out_size=cde_state_dim,
             width_size=vf_hidden_dim,
-            depth=depth,
+            depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,
         )
         self.func = CDEFunc(
-            data_size=input_path_dim,
+            input_path_dim=input_path_dim,
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
-            depth=depth,
+            vf_mlp_depth=vf_mlp_depth,
             key=k2,
         )
         self.readout = eqx.nn.Linear(

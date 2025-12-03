@@ -53,9 +53,14 @@ class NCDEConfig(BaseModel):
     """Top-level NCDE configuration composed of model params."""
 
     # Model params
-    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
-    depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    initial_cond_mlp_depth: PositiveInt = Field(
+        description="Initial condition MLP depth (number of hidden layers)"
+    )
+    vf_mlp_depth: PositiveInt = Field(
+        description="Vector field MLP depth (number of hidden layers)"
+    )
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
     # Solver tolerances
@@ -70,7 +75,12 @@ class NRDEConfig(BaseModel):
     # Model params
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
-    depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
+    initial_cond_mlp_depth: PositiveInt = Field(
+        description="Initial condition MLP depth (number of hidden layers)"
+    )
+    vf_mlp_depth: PositiveInt = Field(
+        description="Vector field MLP depth (number of hidden layers)"
+    )
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
     # Signature config
@@ -88,7 +98,12 @@ class LogNCDEConfig(BaseModel):
     # Model params
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
-    depth: PositiveInt = Field(description="MLP depth (number of hidden layers)")
+    initial_cond_mlp_depth: PositiveInt = Field(
+        description="Initial condition MLP depth (number of hidden layers)"
+    )
+    vf_mlp_depth: PositiveInt = Field(
+        description="Vector field MLP depth (number of hidden layers)"
+    )
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
     # Signature config
