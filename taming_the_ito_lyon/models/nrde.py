@@ -10,8 +10,7 @@ import jax.random as jr
 from collections.abc import Callable
 import diffrax
 
-from stochastax.analytics import get_log_signature_dim
-
+from stochastax.hopf_algebras import ShuffleHopfAlgebra
 from .logsignatures import compute_windowed_logsignatures
 
 
@@ -24,8 +23,9 @@ class NRDEFunc(eqx.Module):
     on each interval.
     """
 
-    mlp: eqx.nn.MLP
+    base_mlp: eqx.nn.MLP
     cde_state_dim: int
+    shuffle_hopf_algebra: ShuffleHopfAlgebra = eqx.field(static=True)
     logsig_size: int
 
     def __init__(
@@ -35,16 +35,16 @@ class NRDEFunc(eqx.Module):
         cde_state_dim: int,
         vf_hidden_dim: int,
         vf_mlp_depth: int,
-        signature_depth: int,
+        shuffle_hopf_algebra: ShuffleHopfAlgebra,
         key: jax.Array,
     ) -> None:
         self.cde_state_dim = cde_state_dim
-        self.logsig_size = int(
-            get_log_signature_dim(depth=signature_depth, dim=input_path_dim)
-        )
-        self.mlp = eqx.nn.MLP(
+        self.shuffle_hopf_algebra = shuffle_hopf_algebra
+        self.logsig_size = shuffle_hopf_algebra.basis_size()
+        self.base_mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
-            out_size=cde_state_dim * self.logsig_size,
+            out_size=cde_state_dim
+            * self.logsig_size,  # NRDE outputs one element per log-signature coefficient
             width_size=vf_hidden_dim,
             depth=vf_mlp_depth,
             activation=jnn.softplus,
@@ -53,7 +53,7 @@ class NRDEFunc(eqx.Module):
         )
 
     def __call__(self, y: jax.Array) -> jax.Array:
-        out = self.mlp(y)
+        out = self.base_mlp(y)
         return out.reshape(self.cde_state_dim, self.logsig_size)
 
 
@@ -69,14 +69,15 @@ class NeuralRDE(eqx.Module):
 
     # Modules
     initial: eqx.nn.MLP
-    func: NRDEFunc
+    cde_func: NRDEFunc
     readout: eqx.nn.Linear
 
     # Static configuration
+    shuffle_hopf_algebra: ShuffleHopfAlgebra = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     signature_depth: int = eqx.field(static=True)
     signature_window_size: int = eqx.field(static=True)
-    evolving_out: bool
+    evolving_out: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -86,7 +87,6 @@ class NeuralRDE(eqx.Module):
         vf_hidden_dim: int,
         initial_cond_mlp_depth: int,
         vf_mlp_depth: int,
-        *,
         signature_depth: int,
         signature_window_size: int,
         key: jax.Array,
@@ -94,6 +94,9 @@ class NeuralRDE(eqx.Module):
         evolving_out: bool = True,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
+        self.shuffle_hopf_algebra = ShuffleHopfAlgebra.build(
+            input_path_dim, signature_depth
+        )
         # Initial state from initial control value (matches NCDE style)
         self.initial = eqx.nn.MLP(
             in_size=input_path_dim,
@@ -103,12 +106,12 @@ class NeuralRDE(eqx.Module):
             activation=jnn.softplus,
             key=k1,
         )
-        self.func = NRDEFunc(
+        self.cde_func = NRDEFunc(
             input_path_dim=input_path_dim,
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
             vf_mlp_depth=vf_mlp_depth,
-            signature_depth=signature_depth,
+            shuffle_hopf_algebra=self.shuffle_hopf_algebra,
             key=k2,
         )
         self.readout = eqx.nn.Linear(
@@ -120,26 +123,9 @@ class NeuralRDE(eqx.Module):
         self.readout_activation = (
             readout_activation if readout_activation is not None else (lambda x: x)
         )
-        self.signature_depth = int(signature_depth)
-        self.signature_window_size = int(signature_window_size)
-        self.evolving_out = bool(evolving_out)
-
-    def _rollout_hidden(self, h0: jax.Array, logsigs: jax.Array) -> jax.Array:
-        """
-        Discrete log-ODE rollout across intervals using a scan.
-
-        logsigs: (T-1, logsig_size)
-        Returns hidden states at each t: (T, cde_state_dim)
-        """
-
-        def step(carry: jax.Array, logsig_i: jax.Array) -> tuple[jax.Array, jax.Array]:
-            h = carry
-            mat = self.func(h)  # (cde_state_dim, logsig_size)
-            h_next = h + mat @ logsig_i
-            return h_next, h_next
-
-        _, h_history = jax.lax.scan(step, h0, logsigs)
-        return jnp.concatenate([h0[None, :], h_history], axis=0)
+        self.signature_depth = signature_depth
+        self.signature_window_size = signature_window_size
+        self.evolving_out = evolving_out
 
     def __call__(
         self,
@@ -159,6 +145,7 @@ class NeuralRDE(eqx.Module):
         - If self.evolving_out is True: shape (T, out_size)
         """
         control = diffrax.CubicInterpolation(ts, coeffs)
+        from diffrax import linear_interpolation
 
         x0 = control.evaluate(ts[0])
         h0 = self.initial(x0)
@@ -166,11 +153,22 @@ class NeuralRDE(eqx.Module):
         logsigs = compute_windowed_logsignatures(
             ts,
             control,
-            signature_depth=int(self.signature_depth),
-            signature_window_size=int(self.signature_window_size),
-            flatten=True,
+            self.shuffle_hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
+            True,
         )  # (T-1 or T-stride, L)
-        hidden_over_time = self._rollout_hidden(h0, logsigs)  # (T, H)
+
+        def step(
+            h: jax.Array,
+            logsig: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            mat = self.cde_func(h)  # (cde_state_dim, logsig_size)
+            h_next = h + mat @ logsig
+            return h_next, h_next
+
+        _, h_history = jax.lax.scan(step, h0, logsigs)
+        hidden_over_time = jnp.concatenate([h0[None, :], h_history], axis=0)
 
         if self.evolving_out:
 

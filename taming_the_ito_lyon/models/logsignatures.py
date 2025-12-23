@@ -6,40 +6,86 @@ import diffrax
 import jax
 import jax.numpy as jnp
 
-from stochastax.control_lifts import compute_log_signature
-from stochastax.control_lifts.signature_types import LogSignature
+from stochastax.control_lifts import (
+    compute_log_signature,
+    compute_nonplanar_branched_signature,
+    compute_planar_branched_signature,
+)
+from stochastax.control_lifts.signature_types import (
+    LogSignature,
+    BCKLogSignature,
+    MKWLogSignature,
+)
+from stochastax.hopf_algebras import ShuffleHopfAlgebra, GLHopfAlgebra, MKWHopfAlgebra
+from stochastax.types import HopfAlgebra, PrimitiveSignature
 
 
+# Overloads for flatten=True (all return jax.Array)
 @overload
 def compute_windowed_logsignatures(
     ts: jax.Array,
     control: diffrax.AbstractPath,
-    *,
+    hopf_algebra: HopfAlgebra,
     signature_depth: int,
     signature_window_size: int,
     flatten: Literal[True],
 ) -> jax.Array: ...
 
 
+# Overloads for flatten=False with specific Hopf algebra types
 @overload
 def compute_windowed_logsignatures(
     ts: jax.Array,
     control: diffrax.AbstractPath,
-    *,
+    hopf_algebra: ShuffleHopfAlgebra,
     signature_depth: int,
     signature_window_size: int,
     flatten: Literal[False],
 ) -> LogSignature: ...
 
 
+@overload
 def compute_windowed_logsignatures(
     ts: jax.Array,
     control: diffrax.AbstractPath,
-    *,
+    hopf_algebra: GLHopfAlgebra,
+    signature_depth: int,
+    signature_window_size: int,
+    flatten: Literal[False],
+) -> BCKLogSignature: ...
+
+
+@overload
+def compute_windowed_logsignatures(
+    ts: jax.Array,
+    control: diffrax.AbstractPath,
+    hopf_algebra: MKWHopfAlgebra,
+    signature_depth: int,
+    signature_window_size: int,
+    flatten: Literal[False],
+) -> MKWLogSignature: ...
+
+
+# Fallback overload for generic HopfAlgebra
+@overload
+def compute_windowed_logsignatures(
+    ts: jax.Array,
+    control: diffrax.AbstractPath,
+    hopf_algebra: HopfAlgebra,
+    signature_depth: int,
+    signature_window_size: int,
+    flatten: Literal[False],
+) -> PrimitiveSignature: ...
+
+
+def compute_windowed_logsignatures(
+    ts: jax.Array,
+    control: diffrax.AbstractPath,
+    hopf_algebra: HopfAlgebra,
     signature_depth: int,
     signature_window_size: int,
     flatten: bool,
-) -> jax.Array | object:
+) -> jax.Array | PrimitiveSignature:
     """Compute per-interval windowed log-signatures along a control path.
 
     Parameters
@@ -48,6 +94,8 @@ def compute_windowed_logsignatures(
         Shape (T,). Monotonically increasing timestamps.
     control:
         A `diffrax.AbstractPath` compatible object (e.g. `CubicInterpolation`).
+    hopf_algebra:
+        A Hopf algebra: ShuffleHopfAlgebra, GLHopfAlgebra, or MKWHopfAlgebra.
     signature_depth:
         Truncation depth for the log-signature.
     signature_window_size:
@@ -69,14 +117,37 @@ def compute_windowed_logsignatures(
         pad_tail = values[:0]
     values_padded = jnp.concatenate([values, pad_tail], axis=0)
 
-    def window_logsig(i: jax.Array) -> jax.Array | object:
+    def window_logsig(i: jax.Array) -> jax.Array | PrimitiveSignature:
         seg = jax.lax.dynamic_slice_in_dim(values_padded, i, window_len, axis=0)
-        logsig = compute_log_signature(
-            seg,
-            depth=signature_depth,
-            log_signature_type="Lyndon words",
-            mode="full",
-        )
+
+        match hopf_algebra:
+            case ShuffleHopfAlgebra():
+                logsig = compute_log_signature(
+                    seg,
+                    signature_depth,
+                    hopf_algebra,
+                    "Lyndon words",
+                    "full",
+                )
+            case GLHopfAlgebra():
+                sig = compute_nonplanar_branched_signature(
+                    seg,
+                    signature_depth,
+                    hopf_algebra,
+                    "full",
+                )
+                logsig = sig.log()
+            case MKWHopfAlgebra():
+                sig = compute_planar_branched_signature(
+                    seg,
+                    signature_depth,
+                    hopf_algebra,
+                    "full",
+                )
+                logsig = sig.log()
+            case _:
+                raise ValueError(f"Unsupported Hopf algebra: {type(hopf_algebra)}")
+
         if flatten:
             return logsig.flatten()
         return logsig

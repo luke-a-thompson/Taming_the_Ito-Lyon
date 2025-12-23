@@ -26,6 +26,11 @@ train = "taming_the_ito_lyon.training.train_cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["taming_the_ito_lyon"]
 
