@@ -4,6 +4,7 @@ dataset_name = "ou_process"
 optimizer = "adam"
 learning_rate = 0.001
 weight_decay = 0.000001
+max_grad_norm = 1.0
 seed = 1
 batch_size = 128
 epochs = 200

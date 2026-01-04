@@ -3,7 +3,6 @@ A reimplementation of Log-NCDE using Jax and Stochastax (https://arxiv.org/abs/2
 """
 
 from collections.abc import Callable
-from functools import partial
 
 import diffrax
 import equinox as eqx
@@ -12,31 +11,44 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
 
-from stochastax.integrators import log_ode
 from stochastax.vector_field_lifts.split_vector_fields import split_multi_vector_field
-from stochastax.types import HopfAlgebra, PrimitiveSignature, VectorFieldLift
 
-from stochastax.hopf_algebras import ShuffleHopfAlgebra, GLHopfAlgebra, MKWHopfAlgebra
-from stochastax.vector_field_lifts import form_lyndon_lift, form_bck_lift, form_mkw_lift
-
-from .logsignatures import compute_windowed_logsignatures
+from stochastax.hopf_algebras import (
+    HopfAlgebra,
+    ShuffleHopfAlgebra,
+    GLHopfAlgebra,
+    MKWHopfAlgebra,
+)
+from stochastax.vector_field_lifts.bck_lift import form_bck_bracket_functions
+from stochastax.vector_field_lifts.lie_lift import form_lyndon_bracket_functions
+from stochastax.vector_field_lifts.mkw_lift import form_mkw_bracket_functions
+from stochastax.vector_field_lifts.vector_field_lift_types import (
+    VectorFieldBracketFunctions,
+    VectorFieldBracketFunctionLift,
+)
+from stochastax.manifolds import Manifold, EuclideanSpace
+from .logsignatures import (
+    compute_disjoint_signature_times,
+    compute_windowed_logsignatures_from_control,
+    compute_windowed_logsignatures_from_values,
+)
+from .extrapolation import ExtrapolationScheme
+from taming_the_ito_lyon.config.config_options import HopfAlgebraType
 
 
 class MNRDEFunc(eqx.Module):
-    """Vector field for a MNDRE built directly from Lyndon brackets.
+    """Vector field for a MNDRE, expressed as a CDE over (flattened) log-signatures.
 
-    Given hidden state h in R^{cde_state_dim}, this builds a list of vector
-    fields V_i: R^{cde_state_dim} -> R^{cde_state_dim} (one per input channel),
-    lifts them to nonlinear multi-nomial brackets, and then uses `m_ode` with the
-    primitive multi-nomial signature on each interval.
+    This returns a matrix of shape (cde_state_dim, logsig_size) which multiplies the
+    time-derivative of a cumulative log-signature control path.
     """
 
     input_path_dim: int
-    base_mlp: eqx.nn.MLP
-    signature_depth: int
+    vf_mlp: eqx.nn.MLP
     cde_state_dim: int
+    manifold: Manifold = eqx.field(static=True)
     hopf_algebra: HopfAlgebra = eqx.field(static=True)
-    vf_lift: VectorFieldLift = eqx.field(static=True)
+    vf_lift: VectorFieldBracketFunctionLift = eqx.field(static=True)
 
     def __init__(
         self,
@@ -45,35 +57,17 @@ class MNRDEFunc(eqx.Module):
         cde_state_dim: int,
         vf_hidden_dim: int,
         vf_mlp_depth: int,
-        signature_depth: int,
         hopf_algebra: HopfAlgebra,
-        tangent_projector: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+        vf_lift: VectorFieldBracketFunctionLift,
+        manifold: Manifold = EuclideanSpace(),
         key: jax.Array,
     ) -> None:
+        # Vector field
         self.cde_state_dim = cde_state_dim
         self.input_path_dim = input_path_dim
-        self.signature_depth = signature_depth
-        self.hopf_algebra = hopf_algebra
-
-        # Default projector for Euclidean case: identity
-        projector = (
-            tangent_projector if tangent_projector is not None else (lambda _y, v: v)
-        )
-
-        # Select and configure the appropriate vector field lift
-        match hopf_algebra:
-            case ShuffleHopfAlgebra():
-                self.vf_lift = partial(form_lyndon_lift, project_to_tangent=projector)
-            case GLHopfAlgebra():
-                self.vf_lift = form_bck_lift
-            case MKWHopfAlgebra():
-                self.vf_lift = partial(form_mkw_lift, project_to_tangent=projector)
-            case _:
-                raise ValueError(f"Unsupported Hopf algebra: {type(hopf_algebra)}")
-
-        self.base_mlp = eqx.nn.MLP(
+        self.vf_mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
-            out_size=input_path_dim * cde_state_dim,  # Following log-NCDE, MNRDE outputs the first level
+            out_size=input_path_dim * cde_state_dim,
             width_size=vf_hidden_dim,
             depth=vf_mlp_depth,
             activation=jnn.softplus,
@@ -81,31 +75,66 @@ class MNRDEFunc(eqx.Module):
             key=key,
         )
 
-    def __call__(
-        self, h: jax.Array, primitive_signature: PrimitiveSignature
-    ) -> jax.Array:
+        # Rough paths
+        self.manifold = manifold
+        self.hopf_algebra = hopf_algebra
+        self.vf_lift = vf_lift
+
+    def __call__(self, t: jax.typing.ArrayLike, y: jax.Array, args: None) -> jax.Array:
+        del t, args
+
+        y_proj = self.manifold.retract(y)
         vector_fields = split_multi_vector_field(
-            self.base_mlp,
-            self.input_path_dim,
-            self.cde_state_dim,
+            self.vf_mlp, self.input_path_dim, self.cde_state_dim
         )
-        brackets = self.vf_lift(vector_fields, h, self.hopf_algebra)
-        return log_ode(brackets, primitive_signature, h)  # type: ignore[call-overload]
+        bracket_functions: VectorFieldBracketFunctions = self.vf_lift(
+            vector_fields,
+            self.hopf_algebra,
+            self.manifold,
+        )
+
+        flat_bracket_functions = [
+            bf
+            for level in bracket_functions
+            for bf in level  # type: ignore[union-attr]
+        ]
+        cols = [
+            self.manifold.project_to_tangent(y_proj, bf(y_proj))
+            for bf in flat_bracket_functions
+        ]
+        return jnp.stack(cols, axis=1)
 
 
 class MNDRE(eqx.Module):
-    """Discrete log-ODE version of NCDE that enforces Lyndon Lie polynomials."""
+    """
+    Discrete log-ODE version of NCDE that enforces Lyndon Lie polynomials.
 
-    initial: eqx.nn.MLP
+    Usage:
+    - Standard mode (n_recon=None): model(ts, coeffs) -> outputs
+    - Extrapolation mode (n_recon set): model(ts, x) -> outputs
+      where ts covers both reconstruction and future times
+    """
+
+    initial_cond_mlp: eqx.nn.MLP
     cde_func: MNRDEFunc
-    readout: eqx.nn.Linear
+    readout_layer: eqx.nn.Linear
+
+    # Extrapolation scheme
+    extrapolation_scheme: ExtrapolationScheme | None
+    n_recon: int | None = eqx.field(static=True)
 
     # Static configuration
     hopf_algebra: HopfAlgebra = eqx.field(static=True)
+    vf_lift: VectorFieldBracketFunctionLift = eqx.field(static=True)
+    manifold: Manifold = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     signature_depth: int = eqx.field(static=True)
     signature_window_size: int = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
+
+    # Solver configuration (matches NeuralCDE/NeuralRDE pattern)
+    solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
+    stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
 
     def __init__(
         self,
@@ -118,15 +147,43 @@ class MNDRE(eqx.Module):
         *,
         signature_depth: int,
         signature_window_size: int,
-        hopf_algebra: HopfAlgebra,
+        hopf_algebra_type: HopfAlgebraType,
         key: jax.Array,
-        tangent_projector: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
-        readout_activation: Callable[[jax.Array], jax.Array] | None = None,
+        manifold: Manifold = EuclideanSpace(),
+        readout_activation: Callable[[jax.Array], jax.Array] = jnn.tanh,
         evolving_out: bool = True,
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
+        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
+            rtol=1e-2, atol=1e-3, dtmin=1e-6
+        ),
+        extrapolation_scheme: ExtrapolationScheme | None = None,
+        n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
-        self.hopf_algebra = hopf_algebra.build(input_path_dim, signature_depth)
-        self.initial = eqx.nn.MLP(
+
+        # Rough paths
+        self.manifold = manifold
+        self.signature_depth = signature_depth
+        self.signature_window_size = signature_window_size
+        match hopf_algebra_type:
+            case HopfAlgebraType.SHUFFLE:
+                self.hopf_algebra = ShuffleHopfAlgebra.build(
+                    input_path_dim, signature_depth
+                )
+                self.vf_lift = form_lyndon_bracket_functions
+            case HopfAlgebraType.GL:
+                self.hopf_algebra = GLHopfAlgebra.build(input_path_dim, signature_depth)
+                self.vf_lift = form_bck_bracket_functions
+            case HopfAlgebraType.MKW:
+                self.hopf_algebra = MKWHopfAlgebra.build(
+                    input_path_dim, signature_depth
+                )
+                self.vf_lift = form_mkw_bracket_functions
+            case _:
+                raise ValueError(f"Unsupported Hopf algebra type: {hopf_algebra_type}")
+
+        # Module
+        self.initial_cond_mlp = eqx.nn.MLP(
             in_size=input_path_dim,
             out_size=cde_state_dim,
             width_size=vf_hidden_dim,
@@ -139,56 +196,139 @@ class MNDRE(eqx.Module):
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
             vf_mlp_depth=vf_mlp_depth,
-            signature_depth=signature_depth,
             hopf_algebra=self.hopf_algebra,
-            tangent_projector=tangent_projector,
+            vf_lift=self.vf_lift,
+            manifold=self.manifold,
             key=k2,
         )
-        self.readout = eqx.nn.Linear(
+        self.readout_layer = eqx.nn.Linear(
             in_features=cde_state_dim,
             out_features=output_path_dim,
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = (
-            readout_activation if readout_activation is not None else (lambda x: x)
-        )
-        self.signature_depth = signature_depth
-        self.signature_window_size = signature_window_size
+        self.readout_activation = readout_activation
+
+        # Static configuration
+        self.extrapolation_scheme = extrapolation_scheme
+        self.n_recon = n_recon
         self.evolving_out = evolving_out
+        self.solver = solver
+        self.stepsize_controller = stepsize_controller
+
+    def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
+        """Apply readout to hidden states."""
+
+        def apply_single(y: jax.Array) -> jax.Array:
+            activation = self.readout_activation(self.readout_layer(y))
+            retracted = self.manifold.retract(activation)
+            return retracted
+
+        return jax.vmap(apply_single)(hidden_states)
+
+    def _forward_with_control(
+        self,
+        ts: jax.Array,
+        control: diffrax.AbstractPath,
+    ) -> jax.Array:
+        """Core forward pass given control path, solved via diffrax.diffeqsolve.
+
+        We compute disjoint-window log-signatures (flattened), build their cumulative
+        sum as a piecewise-linear control path in log-signature space, and solve the
+        induced controlled differential equation with Diffrax.
+        """
+        x0 = control.evaluate(ts[0])
+        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
+        logsigs = compute_windowed_logsignatures_from_control(
+            ts,
+            control,
+            self.hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
+        )
+        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
+        logsig_size = int(logsigs.shape[-1])
+        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
+        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
+        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+
+        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
+        saveat = diffrax.SaveAt(ts=ts)
+        solution = diffrax.diffeqsolve(
+            terms=term,
+            solver=self.solver,
+            t0=ts[0],
+            t1=ts[-1],
+            dt0=None,
+            y0=h0,
+            stepsize_controller=self.stepsize_controller,
+            saveat=saveat,
+        )
+        assert solution.ys is not None
+        return jax.vmap(self.manifold.retract)(solution.ys)
+
+    def _forward_with_values(
+        self, ts: jax.Array, control_values: jax.Array
+    ) -> jax.Array:
+        """Core forward pass given sampled control values (standard mode fast path)."""
+        x0 = control_values[0]
+        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
+
+        logsigs = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
+        )
+        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
+        logsig_size = int(logsigs.shape[-1])
+        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
+        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
+        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+
+        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
+        saveat = diffrax.SaveAt(ts=ts)
+        solution = diffrax.diffeqsolve(
+            terms=term,
+            solver=self.solver,
+            t0=ts[0],
+            t1=ts[-1],
+            dt0=None,
+            y0=h0,
+            stepsize_controller=self.stepsize_controller,
+            saveat=saveat,
+        )
+        assert solution.ys is not None
+        return jax.vmap(self.manifold.retract)(solution.ys)
 
     def __call__(
         self,
         ts: jax.Array,
-        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        x: jax.Array,
     ) -> jax.Array:
-        control = diffrax.CubicInterpolation(ts, coeffs)
-        x0 = control.evaluate(ts[0])
-        h0 = self.initial(x0)
-        logsigs = compute_windowed_logsignatures(
-            ts,
-            control,
-            self.hopf_algebra,
-            signature_depth=self.signature_depth,
-            signature_window_size=self.signature_window_size,
-            flatten=False,
-        )
+        """
+        Forward pass.
 
-        def step(
-            h: jax.Array,
-            primitive_signature: PrimitiveSignature,
-        ) -> tuple[jax.Array, jax.Array]:
-            new_h = self.cde_func(h, primitive_signature)
-            return new_h, new_h
+        Standard mode (self.extrapolation_scheme=None):
+            model(ts, coeffs) -> outputs
 
-        _, h_history = jax.lax.scan(step, h0, logsigs)
-        hidden_over_time = jnp.concatenate([h0[None, :], h_history], axis=0)
+        Extrapolation mode (self.extrapolation_scheme is set):
+            model(ts, x) -> outputs
+        """
+        if self.extrapolation_scheme is not None:
+            assert self.n_recon is not None, (
+                "n_recon must be set when using extrapolation_scheme"
+            )
+            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            hidden = self._forward_with_control(ts, control)
+            outputs = self._apply_readout(hidden)
 
-        if self.evolving_out:
+            return outputs
+        else:
+            # Standard mode
+            hidden = self._forward_with_values(ts, x)
 
-            def apply_readout(y: jax.Array) -> jax.Array:
-                return self.readout_activation(self.readout(y))
+            if self.evolving_out:
+                return self._apply_readout(hidden)
 
-            return jax.vmap(apply_readout)(hidden_over_time)
-
-        return self.readout_activation(self.readout(hidden_over_time[-1]))
+            return self.readout_activation(self.readout_layer(hidden[-1]))

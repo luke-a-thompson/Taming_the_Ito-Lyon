@@ -1,9 +1,15 @@
 [experiment_config]
 model_type = "ncde"
 dataset_name = "ou_process"
+
+# Optimizer
 optimizer = "adam"
 learning_rate = 0.001
 weight_decay = 0.000001
+max_grad_norm = 1.0
+
+# Training
+loss = "mse"
 seed = 1
 batch_size = 128
 epochs = 200
@@ -12,6 +18,7 @@ epochs = 200
 
 # NCDE model parameters
 cde_state_dim = 64
+init_hidden_dim = 64
 vf_hidden_dim = 64
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3

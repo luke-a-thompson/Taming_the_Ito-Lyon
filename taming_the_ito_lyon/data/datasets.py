@@ -1,8 +1,9 @@
+from typing import Generator, Never
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import diffrax
 from tqdm.auto import tqdm
 
 
@@ -17,21 +18,6 @@ def add_time_channel(values: jax.Array) -> jax.Array:
     ts = jnp.linspace(0.0, 1.0, length, dtype=values.dtype)
     time_channel = jnp.broadcast_to(ts[None, :, None], (batch_size, length, 1))
     return jnp.concatenate([time_channel, values], axis=-1)
-
-
-def compute_cubic_coeffs_batch(
-    ts: jax.Array, ys: jax.Array
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """
-    Compute batched Hermite cubic spline coefficients.
-
-    ts: shape (T,)
-    ys: shape (B, T, C)
-    returns: tuple of 4 arrays each of shape (B, T, C)
-    """
-    vmapped = jax.vmap(diffrax.backward_hermite_coefficients, in_axes=(None, 0))
-    a, b, c, d = vmapped(ts, ys)
-    return (a, b, c, d)
 
 
 def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
@@ -50,14 +36,15 @@ def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
 
 def prepare_dataset(
     npz_path: str,
-) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
-    Load dataset and precompute cubic coefficients with time channel.
+    Load dataset with raw control values (including time channel).
 
-    Returns (ts_batched, solution, coeffs_batched) suitable for the dataloader.
-    - ts_batched: shape (B, T)
-    - solution: shape (B, T, C)
-    - coeffs_batched: tuple of arrays each shape (B, T, data_channels)
+    Returns:
+        Tuple of (ts_batched, solution, control_values)
+        - ts_batched: shape (B, T)
+        - solution: shape (B, T, C)
+        - control_values: shape (B, T, C+1) - includes time channel
     """
     solution, driver = load_npz_dataset(npz_path)
     tqdm.write(
@@ -73,14 +60,13 @@ def prepare_dataset(
     ts_batched = jnp.broadcast_to(ts[None, :], (batch_size, length))
 
     control_values = add_time_channel(driver)
-    coeffs_batched = compute_cubic_coeffs_batch(ts, control_values)
-    return ts_batched, solution, coeffs_batched
+    return ts_batched, solution, control_values
 
 
 def split_train_val_test(
     ts_batched: jax.Array,
     solution: jax.Array,
-    coeffs_batched: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    control_values: jax.Array,
     *,
     train_fraction: float = 0.6,
     val_fraction: float = 0.2,
@@ -88,17 +74,21 @@ def split_train_val_test(
 ) -> tuple[
     jax.Array,
     jax.Array,
-    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     jax.Array,
     jax.Array,
-    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     jax.Array,
     jax.Array,
-    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    jax.Array,
+    jax.Array,
+    jax.Array,
 ]:
     """
     Split dataset into train/val/test along the batch dimension.
-    Returns (ts_train, target_train, coeffs_train, ts_val, target_val, coeffs_val, ts_test, target_test, coeffs_test).
+
+    Returns:
+        (ts_train, target_train, control_train,
+         ts_val, target_val, control_val,
+         ts_test, target_test, control_test)
     """
     batch_count = solution.shape[0]
     # Normalize if they don't sum to 1.0 to honor intent
@@ -119,57 +109,56 @@ def split_train_val_test(
 
     ts_train = ts_batched[:train_size]
     target_train = solution[:train_size]
-    a, b, c, d = coeffs_batched
-    coeffs_train = (a[:train_size], b[:train_size], c[:train_size], d[:train_size])
+    control_train = control_values[:train_size]
 
     ts_val = ts_batched[train_size : train_size + val_size]
     target_val = solution[train_size : train_size + val_size]
-    coeffs_val = (
-        a[train_size : train_size + val_size],
-        b[train_size : train_size + val_size],
-        c[train_size : train_size + val_size],
-        d[train_size : train_size + val_size],
-    )
+    control_val = control_values[train_size : train_size + val_size]
 
     ts_test = ts_batched[train_size + val_size : train_size + val_size + test_size]
     target_test = solution[train_size + val_size : train_size + val_size + test_size]
-    coeffs_test = (
-        a[train_size + val_size : train_size + val_size + test_size],
-        b[train_size + val_size : train_size + val_size + test_size],
-        c[train_size + val_size : train_size + val_size + test_size],
-        d[train_size + val_size : train_size + val_size + test_size],
-    )
+    control_test = control_values[
+        train_size + val_size : train_size + val_size + test_size
+    ]
 
     return (
         ts_train,
         target_train,
-        coeffs_train,
+        control_train,
         ts_val,
         target_val,
-        coeffs_val,
+        control_val,
         ts_test,
         target_test,
-        coeffs_test,
+        control_test,
     )
 
 
 def make_dataloader(
     timestep: jax.Array,
     solution: jax.Array,
-    drivers: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    control_values: jax.Array,
     batch_size: int,
     *,
     key: jax.Array,
-):
+) -> Generator[tuple[jax.Array, jax.Array, jax.Array], None, Never]:
     """
-    Simple shuffled minibatch generator yielding (timestep_b, solution_b, drivers_b).
-    - timestep_b: shape (B, T)
-    - solution_b: shape (B, T, C)
-    - drivers_b: tuple of arrays, each shape (B, T, data_channels)
+    Simple shuffled minibatch generator.
+
+    Args:
+        timestep: shape (N, T)
+        solution: shape (N, T, C)
+        control_values: shape (N, T, C+1) - raw control values with time channel
+        batch_size: minibatch size
+        key: random key for shuffling
+
+    Yields:
+        (timestep_b, solution_b, control_b) where control_b is raw control values
+        of shape (B, T, C+1).
     """
     dataset_size = solution.shape[0]
     indices = jnp.arange(dataset_size)
-    a, b, c, d = drivers
+
     while True:
         perm = jax.random.permutation(key, indices)
         (key,) = jr.split(key, 1)
@@ -178,5 +167,5 @@ def make_dataloader(
             batch_idx = perm[start:end]
             ts_b = timestep[batch_idx]
             sol_b = solution[batch_idx]
-            drv_b = (a[batch_idx], b[batch_idx], c[batch_idx], d[batch_idx])
-            yield ts_b, sol_b, drv_b
+            control_b = control_values[batch_idx]
+            yield ts_b, sol_b, control_b

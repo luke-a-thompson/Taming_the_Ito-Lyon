@@ -10,7 +10,12 @@ import shutil
 import signal
 import time
 
-from taming_the_ito_lyon.training.train import train_epoch, eval_epoch
+from taming_the_ito_lyon.training.train import (
+    train_epoch,
+    eval_epoch,
+    mse_loss,
+    rotational_geodesic_loss,
+)
 from taming_the_ito_lyon.training.factories import (
     create_model,
     create_optimizer,
@@ -23,6 +28,7 @@ from taming_the_ito_lyon.data import (
 from taming_the_ito_lyon.config import (
     Config,
 )
+from taming_the_ito_lyon.config.config_options import LossType
 from taming_the_ito_lyon.models import Model
 
 SAVED_MODELS_DIR = "saved_models"
@@ -41,9 +47,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     key = jr.PRNGKey(config.experiment_config.seed)
     model_key, loader_key = jr.split(key, 2)
 
-    ts_batched, solution, coeffs_batched = create_dataset(config=config)
+    ts_batched, solution, control_values = create_dataset(config=config)
     batch_count, length, target_channels = solution.shape
-    data_channels = int(coeffs_batched[0].shape[-1])
+    data_channels = int(control_values[0].shape[-1])
 
     model = create_model(
         config=config,
@@ -61,23 +67,31 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         optimizer_name=config.experiment_config.optimizer,
         learning_rate=config.experiment_config.learning_rate,
         weight_decay=config.experiment_config.weight_decay,
+        max_grad_norm=config.experiment_config.max_grad_norm,
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+
+    # Select loss function
+    loss_fn_map = {
+        LossType.MSE: mse_loss,
+        LossType.RGE: rotational_geodesic_loss,
+    }
+    loss_fn = loss_fn_map[config.experiment_config.loss]
 
     (
         ts_train,
         target_train,
-        coeffs_train,
+        control_values_train,
         ts_val,
         target_val,
-        coeffs_val,
+        control_values_val,
         ts_test,
         target_test,
-        coeffs_test,
+        control_values_test,
     ) = split_train_val_test(
         ts_batched,
         solution,
-        coeffs_batched,
+        control_values,
         train_fraction=config.experiment_config.train_fraction,
         val_fraction=config.experiment_config.val_fraction,
         test_fraction=config.experiment_config.test_fraction,
@@ -85,10 +99,11 @@ def experiment(config: Config, config_path: str | None = None) -> None:
 
     batch_size = int(config.experiment_config.batch_size)
     num_batches = (ts_train.shape[0] + batch_size - 1) // batch_size
+
     loader = make_dataloader(
         timestep=ts_train,
         solution=target_train,
-        drivers=coeffs_train,
+        control_values=control_values_train,
         batch_size=batch_size,
         key=loader_key,
     )
@@ -129,11 +144,14 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             opt_state=opt_state,
             loader=loader,
             num_batches=num_batches,
+            loss_fn=loss_fn,
         )
 
         min_train_loss = min(min_train_loss, train_loss)
 
-        val_loss_value = eval_epoch(model, ts_val, target_val, coeffs_val)
+        val_loss_value = eval_epoch(
+            model, ts_val, target_val, control_values_val, loss_fn
+        )
         if val_loss_value < best_val_loss:
             best_val_loss = val_loss_value
             best_epoch = epoch_idx
@@ -159,7 +177,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     # Evaluate best model on test set
     best_model: Model = eqx.tree_deserialise_leaves(temp_best_path, model)
     inference_start = time.perf_counter()
-    test_loss_value = eval_epoch(best_model, ts_test, target_test, coeffs_test)
+    test_loss_value = eval_epoch(
+        best_model, ts_test, target_test, control_values_test, loss_fn
+    )
     inference_elapsed = time.perf_counter() - inference_start
 
     # Create run directory and save final artifacts

@@ -6,8 +6,15 @@ from taming_the_ito_lyon.config import (
     NCDEConfig,
     LogNCDEConfig,
     NRDEConfig,
+    MNRDEConfig,
 )
-from taming_the_ito_lyon.models import NeuralCDE, LogNCDE, NeuralRDE
+from taming_the_ito_lyon.models import (
+    NeuralCDE,
+    LogNCDE,
+    NeuralRDE,
+    MNDRE,
+    create_scheme,
+)
 from taming_the_ito_lyon.config import DATASETS
 from taming_the_ito_lyon.data.datasets import prepare_dataset
 
@@ -18,22 +25,46 @@ def create_model(
     input_path_dim: int,
     output_path_dim: int,
     key: jax.Array,
-) -> NeuralCDE | LogNCDE | NeuralRDE:
+) -> NeuralCDE | LogNCDE | NeuralRDE | MNDRE:
     match config.nn_config:
         case NCDEConfig():
+            extrapolation_scheme = None
+            model_key = key
+            if config.experiment_config.use_extrapolation:
+                # Config validator ensures these are not None
+                model_key, scheme_key = jax.random.split(key)
+                extrapolation_scheme = create_scheme(
+                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
+                    num_points=config.experiment_config.n_recon,  # type: ignore
+                    input_dim=input_path_dim,
+                    key=scheme_key,
+                )
             return NeuralCDE(
                 input_path_dim=input_path_dim,
-                cde_state_dim=config.nn_config.cde_state_dim,
-                vf_hidden_dim=config.nn_config.vf_hidden_dim,
+                init_hidden_dim=config.nn_config.init_hidden_dim,
                 initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 vf_mlp_depth=config.nn_config.vf_mlp_depth,
+                cde_state_dim=config.nn_config.cde_state_dim,
                 output_path_dim=output_path_dim,
-                key=key,
+                key=model_key,
                 rtol=config.nn_config.rtol,
                 atol=config.nn_config.atol,
                 dtmin=config.nn_config.dtmin,
+                extrapolation_scheme=extrapolation_scheme,
+                n_recon=config.experiment_config.n_recon,
             )
         case LogNCDEConfig():
+            extrapolation_scheme = None
+            model_key = key
+            if config.experiment_config.use_extrapolation:
+                model_key, scheme_key = jax.random.split(key)
+                extrapolation_scheme = create_scheme(
+                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
+                    num_points=config.experiment_config.n_recon,  # type: ignore
+                    input_dim=input_path_dim,
+                    key=scheme_key,
+                )
             return LogNCDE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
@@ -43,7 +74,9 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
-                key=key,
+                extrapolation_scheme=extrapolation_scheme,
+                n_recon=config.experiment_config.n_recon,
+                key=model_key,
             )
         case NRDEConfig():
             return NeuralRDE(
@@ -56,6 +89,35 @@ def create_model(
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
                 key=key,
+            )
+        case MNRDEConfig():
+            extrapolation_scheme = None
+
+            if config.experiment_config.use_extrapolation:
+                # Config validator ensures these are not None
+                model_key, scheme_key = jax.random.split(key)
+                extrapolation_scheme = create_scheme(
+                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
+                    num_points=config.experiment_config.n_recon,  # type: ignore
+                    input_dim=input_path_dim,
+                    key=scheme_key,
+                )
+            else:
+                model_key = key
+
+            return MNDRE(
+                input_path_dim=input_path_dim,
+                cde_state_dim=config.nn_config.cde_state_dim,
+                vf_hidden_dim=config.nn_config.vf_hidden_dim,
+                initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                vf_mlp_depth=config.nn_config.vf_mlp_depth,
+                output_path_dim=output_path_dim,
+                signature_depth=config.nn_config.signature_depth,
+                signature_window_size=config.nn_config.signature_window_size,
+                hopf_algebra_type=config.nn_config.hopf_algebra,
+                extrapolation_scheme=extrapolation_scheme,
+                n_recon=config.experiment_config.n_recon,
+                key=model_key,
             )
         # case SDEONetConfig():
         #     return SDEONet(
@@ -83,27 +145,36 @@ def create_optimizer(
     optimizer_name: Optimizer,
     learning_rate: float,
     weight_decay: float,
+    max_grad_norm: float | None = None,
 ) -> optax.GradientTransformation:
     match optimizer_name:
         case Optimizer.ADAM:
-            return optax.adam(learning_rate)
+            base_optim = optax.adam(learning_rate)
         case Optimizer.ADAMW:
-            return optax.adamw(learning_rate, weight_decay=weight_decay)
+            base_optim = optax.adamw(learning_rate, weight_decay=weight_decay)
         case Optimizer.MUON:
-            return optax.contrib.muon(
+            base_optim = optax.contrib.muon(
                 learning_rate=learning_rate, weight_decay=weight_decay
             )
         case _:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
+    # Chain gradient clipping if max_grad_norm is specified
+    if max_grad_norm is not None:
+        return optax.chain(
+            optax.clip_by_global_norm(max_grad_norm),
+            base_optim,
+        )
+    return base_optim
+
 
 def create_dataset(
     config: Config,
-) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Create dataset arrays from configuration.
 
-    Returns (ts_batched, solution, coeffs_batched).
+    Returns (ts_batched, solution, control_values).
     """
     dataset_name = config.experiment_config.dataset_name
     if dataset_name not in DATASETS:
@@ -111,5 +182,5 @@ def create_dataset(
             f"Unknown dataset name '{dataset_name}'. Available: {list(DATASETS.keys())}"
         )
     npz_path = DATASETS[dataset_name]["npz_path"]
-    ts_batched, solution, coeffs_batched = prepare_dataset(npz_path)
-    return ts_batched, solution, coeffs_batched
+    ts_batched, solution, control_values = prepare_dataset(npz_path)
+    return ts_batched, solution, control_values

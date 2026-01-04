@@ -1,6 +1,13 @@
+from __future__ import annotations
 import tomllib
 from pydantic import BaseModel, Field, PositiveInt, PositiveFloat, model_validator
-from taming_the_ito_lyon.config import Optimizer, ModelType
+from taming_the_ito_lyon.config.config_options import (
+    Optimizer,
+    ModelType,
+    ExtrapolationScheme,
+    LossType,
+    HopfAlgebraType,
+)
 
 
 class ExperimentConfig(BaseModel):
@@ -15,17 +22,29 @@ class ExperimentConfig(BaseModel):
     )
 
     train_fraction: PositiveFloat = Field(
-        default=0.6, le=1.0, description="Fraction of data for training"
+        default=0.8, le=1.0, description="Fraction of data for training"
     )
     val_fraction: PositiveFloat = Field(
-        default=0.2, le=1.0, description="Fraction of data for validation"
+        default=0.1, le=1.0, description="Fraction of data for validation"
     )
     test_fraction: PositiveFloat = Field(
-        default=0.2, le=1.0, description="Fraction of data for testing"
+        default=0.1, le=1.0, description="Fraction of data for testing"
+    )
+
+    # Extrapolation settings
+    use_extrapolation: bool = Field(
+        default=False, description="Enable extrapolation mode for training"
+    )
+    extrapolation_scheme: ExtrapolationScheme | None = Field(
+        default=None, description="Extrapolation scheme"
+    )
+    n_recon: PositiveInt | None = Field(
+        default=None,
+        description="Number of reconstruction points for extrapolation (None for standard mode)",
     )
 
     @model_validator(mode="after")
-    def validate_fractions_sum(self) -> "ExperimentConfig":
+    def validate_fractions_sum(self) -> ExperimentConfig:
         total = self.train_fraction + self.val_fraction + self.test_fraction
         if total > 1.0:
             raise ValueError(
@@ -33,12 +52,30 @@ class ExperimentConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_extrapolation_params(self) -> ExperimentConfig:
+        if self.use_extrapolation:
+            if self.extrapolation_scheme is None:
+                raise ValueError(
+                    "extrapolation_scheme must be specified when use_extrapolation=True"
+                )
+            if self.n_recon is None:
+                raise ValueError(
+                    "n_recon must be specified when use_extrapolation=True"
+                )
+        return self
+
     # Optimizer
     optimizer: Optimizer = Field(description="Optimizer name")
     learning_rate: PositiveFloat = Field(le=1.0, description="Optimizer learning rate")
     weight_decay: PositiveFloat = Field(le=1.0, description="Optimizer weight decay")
+    max_grad_norm: PositiveFloat | None = Field(
+        default=None,
+        description="Maximum gradient norm for clipping (None for no clipping)",
+    )
 
     # Training
+    loss: LossType = Field(description="Loss function to use")
     seed: PositiveInt = Field(description="PRNG seed")
     batch_size: PositiveInt = Field(
         multiple_of=8, description="Batch size; divisible by 8"
@@ -53,14 +90,17 @@ class NCDEConfig(BaseModel):
     """Top-level NCDE configuration composed of model params."""
 
     # Model params
-    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
-    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    init_hidden_dim: PositiveInt = Field(
+        description="Initial condition MLP hidden state dimension"
+    )
     initial_cond_mlp_depth: PositiveInt = Field(
         description="Initial condition MLP depth (number of hidden layers)"
     )
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
     vf_mlp_depth: PositiveInt = Field(
         description="Vector field MLP depth (number of hidden layers)"
     )
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
     # Solver tolerances
@@ -90,6 +130,30 @@ class NRDEConfig(BaseModel):
     signature_window_size: PositiveInt = Field(
         default=1, description="Data steps per log-signature window"
     )
+
+
+class MNRDEConfig(BaseModel):
+    """Top-level M-NRDE configuration composed of model params."""
+
+    # Model params
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
+    initial_cond_mlp_depth: PositiveInt = Field(
+        description="Initial condition MLP depth (number of hidden layers)"
+    )
+    vf_mlp_depth: PositiveInt = Field(
+        description="Vector field MLP depth (number of hidden layers)"
+    )
+    out_size: PositiveInt = Field(description="Output channels predicted by readout")
+
+    # Signature config
+    signature_depth: PositiveInt = Field(le=5, description="Signature depth")
+    signature_window_size: PositiveInt = Field(
+        default=1, description="Data steps per log-signature window"
+    )
+
+    # Hopf algebra for M-NRDE
+    hopf_algebra: HopfAlgebraType = Field(description="Hopf algebra to use")
 
 
 class LogNCDEConfig(BaseModel):
@@ -148,6 +212,7 @@ class Config(BaseModel):
     ncde_config: NCDEConfig | None = None
     log_ncde_config: LogNCDEConfig | None = None
     nrde_config: NRDEConfig | None = None
+    mnrde_config: MNRDEConfig | None = None
     sdeonet_config: SDEONetConfig | None = None
 
     @model_validator(mode="after")
@@ -159,6 +224,7 @@ class Config(BaseModel):
             ModelType.NCDE: self.ncde_config,
             ModelType.LOG_NCDE: self.log_ncde_config,
             ModelType.NRDE: self.nrde_config,
+            ModelType.MNRDE: self.mnrde_config,
             ModelType.SDEONET: self.sdeonet_config,
         }
 
@@ -173,6 +239,7 @@ class Config(BaseModel):
             self.ncde_config,
             self.log_ncde_config,
             self.nrde_config,
+            self.mnrde_config,
             self.sdeonet_config,
         ]
         num_provided = sum(c is not None for c in all_configs)
@@ -182,7 +249,9 @@ class Config(BaseModel):
         return self
 
     @property
-    def nn_config(self) -> NCDEConfig | LogNCDEConfig | NRDEConfig | SDEONetConfig:
+    def nn_config(
+        self,
+    ) -> NCDEConfig | LogNCDEConfig | NRDEConfig | MNRDEConfig | SDEONetConfig:
         """Get the active model configuration based on model_type."""
         model_type = self.experiment_config.model_type
 
@@ -195,6 +264,9 @@ class Config(BaseModel):
         elif model_type == ModelType.NRDE:
             assert self.nrde_config is not None
             return self.nrde_config
+        elif model_type == ModelType.MNRDE:
+            assert self.mnrde_config is not None
+            return self.mnrde_config
         elif model_type == ModelType.SDEONET:
             assert self.sdeonet_config is not None
             return self.sdeonet_config

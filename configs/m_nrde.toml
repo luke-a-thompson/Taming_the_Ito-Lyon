@@ -1,6 +1,11 @@
 [experiment_config]
-model_type = "nrde"
+model_type = "mnrde"
 dataset_name = "ou_process"
+
+# Extrapolation settings
+use_extrapolation = false
+extrapolation_scheme = "sg"
+n_recon = 12
 
 # Optimizer
 optimizer = "adam"
@@ -14,9 +19,9 @@ seed = 1
 batch_size = 64
 epochs = 200
 
-[nrde_config]
+[mnrde_config]
 
-# NRDE model parameters
+# M-NRDE model parameters
 cde_state_dim = 16
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
@@ -25,4 +30,6 @@ out_size = 1
 
 # Log-signature configuration
 signature_depth = 2
-signature_window_size = 16
+signature_window_size = 32
+
+hopf_algebra = "mkw"

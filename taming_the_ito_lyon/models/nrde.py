@@ -11,7 +11,10 @@ from collections.abc import Callable
 import diffrax
 
 from stochastax.hopf_algebras import ShuffleHopfAlgebra
-from .logsignatures import compute_windowed_logsignatures
+from .logsignatures import (
+    compute_disjoint_signature_times,
+    compute_windowed_logsignatures_from_values,
+)
 
 
 class NRDEFunc(eqx.Module):
@@ -23,7 +26,7 @@ class NRDEFunc(eqx.Module):
     on each interval.
     """
 
-    base_mlp: eqx.nn.MLP
+    vf_mlp: eqx.nn.MLP
     cde_state_dim: int
     shuffle_hopf_algebra: ShuffleHopfAlgebra = eqx.field(static=True)
     logsig_size: int
@@ -41,7 +44,7 @@ class NRDEFunc(eqx.Module):
         self.cde_state_dim = cde_state_dim
         self.shuffle_hopf_algebra = shuffle_hopf_algebra
         self.logsig_size = shuffle_hopf_algebra.basis_size()
-        self.base_mlp = eqx.nn.MLP(
+        self.vf_mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
             out_size=cde_state_dim
             * self.logsig_size,  # NRDE outputs one element per log-signature coefficient
@@ -52,8 +55,9 @@ class NRDEFunc(eqx.Module):
             key=key,
         )
 
-    def __call__(self, y: jax.Array) -> jax.Array:
-        out = self.base_mlp(y)
+    def __call__(self, t: jax.typing.ArrayLike, y: jax.Array, args: None) -> jax.Array:
+        del t, args
+        out = self.vf_mlp(y)
         return out.reshape(self.cde_state_dim, self.logsig_size)
 
 
@@ -79,6 +83,10 @@ class NeuralRDE(eqx.Module):
     signature_window_size: int = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
 
+    # Solver configuration (matches NeuralCDE pattern)
+    solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
+    stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
+
     def __init__(
         self,
         input_path_dim: int,
@@ -91,6 +99,10 @@ class NeuralRDE(eqx.Module):
         signature_window_size: int,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] | None = None,
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
+        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
+            rtol=1e-2, atol=1e-3, dtmin=1e-6
+        ),
         evolving_out: bool = True,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
@@ -127,10 +139,52 @@ class NeuralRDE(eqx.Module):
         self.signature_window_size = signature_window_size
         self.evolving_out = evolving_out
 
+        self.solver = solver
+        self.stepsize_controller = stepsize_controller
+
+    def _forward_with_values(
+        self,
+        ts: jax.Array,
+        control_values: jax.Array,
+    ) -> jax.Array:
+        """Core forward pass given sampled control values.
+
+        This avoids constructing a control path and avoids evaluating it at `ts`.
+        """
+        x0 = control_values[0]
+        h0 = self.initial(x0)
+
+        logsigs = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.shuffle_hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
+        )  # (num_windows, logsig_size)
+        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
+        logsig_size = int(logsigs.shape[-1])
+        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
+        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
+        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+
+        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
+        saveat = diffrax.SaveAt(ts=ts)
+        solution = diffrax.diffeqsolve(
+            terms=term,
+            solver=self.solver,
+            t0=ts[0],
+            t1=ts[-1],
+            dt0=None,
+            y0=h0,
+            stepsize_controller=self.stepsize_controller,
+            saveat=saveat,
+        )
+        assert solution.ys is not None
+        return solution.ys
+
     def __call__(
         self,
         ts: jax.Array,
-        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        control_values: jax.Array,
     ) -> jax.Array:
         """
         Forward pass.
@@ -144,31 +198,7 @@ class NeuralRDE(eqx.Module):
         - If self.evolving_out is False: shape (out_size,)
         - If self.evolving_out is True: shape (T, out_size)
         """
-        control = diffrax.CubicInterpolation(ts, coeffs)
-        from diffrax import linear_interpolation
-
-        x0 = control.evaluate(ts[0])
-        h0 = self.initial(x0)
-
-        logsigs = compute_windowed_logsignatures(
-            ts,
-            control,
-            self.shuffle_hopf_algebra,
-            self.signature_depth,
-            self.signature_window_size,
-            True,
-        )  # (T-1 or T-stride, L)
-
-        def step(
-            h: jax.Array,
-            logsig: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
-            mat = self.cde_func(h)  # (cde_state_dim, logsig_size)
-            h_next = h + mat @ logsig
-            return h_next, h_next
-
-        _, h_history = jax.lax.scan(step, h0, logsigs)
-        hidden_over_time = jnp.concatenate([h0[None, :], h_history], axis=0)
+        hidden_over_time = self._forward_with_values(ts, control_values)
 
         if self.evolving_out:
 

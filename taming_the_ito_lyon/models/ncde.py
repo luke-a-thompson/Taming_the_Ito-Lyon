@@ -6,11 +6,12 @@ https://docs.kidger.site/diffrax/examples/neural_cde/
 
 import equinox as eqx
 import jax
-import jax.typing as jtp
 import jax.nn as jnn
 import jax.random as jr
 import diffrax
 from collections.abc import Callable
+
+from .extrapolation import ExtrapolationScheme
 
 
 class CDEFunc(eqx.Module):
@@ -21,8 +22,8 @@ class CDEFunc(eqx.Module):
     R^{cde_state_dim x data_size} which is multiplied against dx/dt.
     """
 
-    mlp: eqx.nn.MLP
     input_path_dim: int
+    vf_mlp: eqx.nn.MLP
     cde_state_dim: int
 
     def __init__(
@@ -34,11 +35,13 @@ class CDEFunc(eqx.Module):
         *,
         key: jax.Array,
     ) -> None:
+        # Vector field
         self.input_path_dim = input_path_dim
         self.cde_state_dim = cde_state_dim
-        self.mlp = eqx.nn.MLP(
+        self.vf_mlp = eqx.nn.MLP(
             in_size=cde_state_dim,
-            out_size=cde_state_dim * input_path_dim,
+            out_size=cde_state_dim
+            * input_path_dim,  # Shaped as such to reshape into (cde_state_dim, input_path_dim) matrix for dx/dt multiplication
             width_size=vf_hidden_dim,
             depth=vf_mlp_depth,
             activation=jnn.softplus,
@@ -46,9 +49,9 @@ class CDEFunc(eqx.Module):
             key=key,
         )
 
-    def __call__(self, t: jtp.ArrayLike, y: jax.Array, args: None) -> jax.Array:
+    def __call__(self, t: jax.typing.ArrayLike, y: jax.Array, args: None) -> jax.Array:
         del t, args
-        out = self.mlp(y)
+        out = self.vf_mlp(y)
         return out.reshape(self.cde_state_dim, self.input_path_dim)
 
 
@@ -62,116 +65,152 @@ class NeuralCDE(eqx.Module):
     """
 
     # Modules
-    initial: eqx.nn.MLP
-    func: CDEFunc
-    readout: eqx.nn.Linear
+    initial_cond_mlp: eqx.nn.MLP
+    cde_func: CDEFunc
+    readout_layer: eqx.nn.Linear
 
     # Static configuration
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
-    rtol: float
-    atol: float
-    dtmin: float
     evolving_out: bool
+
+    # Extrapolation scheme
+    extrapolation_scheme: ExtrapolationScheme | None = eqx.field(static=True)
+    n_recon: int | None = eqx.field(static=True)
+
+    # Solver configuration
+    solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
+    stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
 
     def __init__(
         self,
         input_path_dim: int,
         cde_state_dim: int,
         output_path_dim: int,
-        vf_hidden_dim: int,
+        init_hidden_dim: int,
         initial_cond_mlp_depth: int,
+        vf_hidden_dim: int,
         vf_mlp_depth: int,
         *,
         key: jax.Array,
-        readout_activation: Callable[[jax.Array], jax.Array] | None = None,
-        rtol: float = 1e-3,
-        atol: float = 1e-6,
+        readout_activation: Callable[[jax.Array], jax.Array] = jnn.tanh,
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
+        stepsize_controller: diffrax.AbstractStepSizeController | None = None,
+        rtol: float = 1e-2,
+        atol: float = 1e-3,
         dtmin: float = 1e-6,
         evolving_out: bool = True,
+        extrapolation_scheme: ExtrapolationScheme | None = None,
+        n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
-        self.initial = eqx.nn.MLP(
+
+        # Modules
+        self.initial_cond_mlp = eqx.nn.MLP(
             in_size=input_path_dim,
-            out_size=cde_state_dim,
+            out_size=init_hidden_dim,
             width_size=vf_hidden_dim,
             depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,
         )
-        self.func = CDEFunc(
+        self.cde_func = CDEFunc(
             input_path_dim=input_path_dim,
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
             vf_mlp_depth=vf_mlp_depth,
             key=k2,
         )
-        self.readout = eqx.nn.Linear(
+        self.readout_layer = eqx.nn.Linear(
             in_features=cde_state_dim,
             out_features=output_path_dim,
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = (
-            readout_activation if readout_activation is not None else (lambda x: x)
-        )
-        self.rtol = rtol
-        self.atol = atol
-        self.dtmin = dtmin
+        self.readout_activation = readout_activation
+
+        # Static configuration
+        self.extrapolation_scheme = extrapolation_scheme
+        self.n_recon = n_recon
         self.evolving_out = evolving_out
 
-    def _solve(
+        # Solver configuration
+        self.solver = solver
+        self.stepsize_controller = (
+            diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin)
+            if stepsize_controller is None
+            else stepsize_controller
+        )
+
+    def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
+        """Apply readout to hidden states."""
+
+        def apply_single(y: jax.Array) -> jax.Array:
+            activation = self.readout_activation(self.readout_layer(y))
+            return activation
+
+        return jax.vmap(apply_single)(hidden_states)
+
+    def _forward_with_control(
         self,
         ts: jax.Array,
         control: diffrax.AbstractPath,
     ) -> jax.Array:
-        term = diffrax.ControlTerm(self.func, control).to_ode()
-        solver = diffrax.Tsit5()
-        stepsize_controller = diffrax.PIDController(
-            rtol=self.rtol, atol=self.atol, dtmin=self.dtmin
-        )
-        y0 = self.initial(control.evaluate(ts[0]))
-        saveat = diffrax.SaveAt(ts=ts) if self.evolving_out else diffrax.SaveAt(t1=True)
+        """Core forward pass given control path (standard Neural CDE).
+
+        We use the provided control path directly in a Diffrax `ControlTerm`, i.e.
+        we solve the vanilla Neural CDE driven by the original interpolation.
+        """
+        x0 = control.evaluate(ts[0])
+        y0 = self.initial_cond_mlp(x0)
+
+        term = diffrax.ControlTerm(self.cde_func, control).to_ode()
+
+        saveat = diffrax.SaveAt(ts=ts)
         solution = diffrax.diffeqsolve(
             terms=term,
-            solver=solver,
+            solver=self.solver,
             t0=ts[0],
             t1=ts[-1],
             dt0=None,
             y0=y0,
-            stepsize_controller=stepsize_controller,
+            stepsize_controller=self.stepsize_controller,
             saveat=saveat,
         )
         assert solution.ys is not None
-        if self.evolving_out:
-            return solution.ys
-        return solution.ys[-1]
+        return solution.ys
 
     def __call__(
         self,
         ts: jax.Array,
-        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        x: jax.Array,
     ) -> jax.Array:
         """
         Forward pass.
 
-        Parameters
-        - ts: shape (T,). Monotonically increasing timestamps.
-        - control_or_coeffs: either a diffrax control path (e.g. CubicInterpolation)
-          or a tuple of cubic coefficients compatible with diffrax.CubicInterpolation.
+        Standard mode (self.extrapolation_scheme is None):
+            model(ts, coeffs) -> outputs
 
-        Returns
-        - If self.evolving_out is False: shape (out_size,)
-        - If self.evolving_out is True: shape (T, out_size)
+        Extrapolation mode (self.extrapolation_scheme is set):
+            model(ts, x) -> outputs
+            where x has shape (T_total, C) and only the first n_recon points are used
+            to fit the control; the remainder is extrapolated.
         """
-        control = diffrax.CubicInterpolation(ts, coeffs)
+        if self.extrapolation_scheme is not None:
+            assert self.n_recon is not None, (
+                "n_recon must be set when using extrapolation_scheme"
+            )
+            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            hidden = self._forward_with_control(ts, control)
+            outputs = self._apply_readout(hidden)
 
-        hidden_states = self._solve(ts, control)
-
-        if self.evolving_out:
-            # Map readout across time
-            def apply_readout(y: jax.Array) -> jax.Array:
-                return self.readout_activation(self.readout(y))
-
-            return jax.vmap(apply_readout)(hidden_states)
+            return outputs
         else:
-            return self.readout_activation(self.readout(hidden_states))
+            # Standard mode: build interpolation from raw values.
+            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=x)
+            control = diffrax.CubicInterpolation(ts, coeffs)
+            hidden = self._forward_with_control(ts, control)
+
+            if self.evolving_out:
+                return self._apply_readout(hidden)
+
+            return self.readout_activation(self.readout_layer(hidden[-1]))

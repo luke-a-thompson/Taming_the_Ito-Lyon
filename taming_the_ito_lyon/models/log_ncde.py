@@ -11,21 +11,22 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
 
-from stochastax.integrators import log_ode
-from stochastax.vector_field_lifts import form_lyndon_lift
+from stochastax.vector_field_lifts.lie_lift import form_lyndon_bracket_functions
 from stochastax.vector_field_lifts.split_vector_fields import split_multi_vector_field
 from stochastax.hopf_algebras import ShuffleHopfAlgebra
-from stochastax.control_lifts import LogSignature
-from .logsignatures import compute_windowed_logsignatures
+from .extrapolation import ExtrapolationScheme
+from .logsignatures import (
+    compute_disjoint_signature_times,
+    compute_windowed_logsignatures_from_control,
+    compute_windowed_logsignatures_from_values,
+)
 
 
 class LogNCDEFunc(eqx.Module):
-    """Vector field for a log-NCDE built directly from Lyndon brackets.
+    """Vector field for a log-NCDE, expressed as a CDE over (flattened) log-signatures.
 
-    Given hidden state h in R^{cde_state_dim}, this builds a list of vector
-    fields V_i: R^{cde_state_dim} -> R^{cde_state_dim} (one per input channel),
-    lifts them to nonlinear Lyndon brackets, and then uses `log_ode` with the
-    primitive log-signature on each interval.
+    This returns a matrix of shape (cde_state_dim, logsig_size) which multiplies the
+    time-derivative of a cumulative log-signature control path.
     """
 
     input_path_dim: int
@@ -56,19 +57,25 @@ class LogNCDEFunc(eqx.Module):
             key=key,
         )
 
-    def __call__(
-        self,
-        h: jax.Array,
-        log_signature: LogSignature,
-    ) -> jax.Array:
-        # multi_vf(y): R^{cde_state_dim} -> R^{input_path_dim * cde_state_dim}
+    def __call__(self, t: jax.typing.ArrayLike, y: jax.Array, args: None) -> jax.Array:
+        del t, args
+
         vector_fields = split_multi_vector_field(
             self.base_mlp,
             self.input_path_dim,
             self.cde_state_dim,
         )
-        brackets = form_lyndon_lift(vector_fields, h, self.shuffle_hopf_algebra)
-        return log_ode(brackets, log_signature, h)
+        bracket_functions = form_lyndon_bracket_functions(
+            vector_fields, self.shuffle_hopf_algebra
+        )
+
+        flat_bracket_functions = [
+            bf
+            for level in bracket_functions
+            for bf in level  # type: ignore[union-attr]
+        ]
+        cols = [bf(y) for bf in flat_bracket_functions]
+        return jnp.stack(cols, axis=1)
 
 
 class LogNCDE(eqx.Module):
@@ -83,6 +90,14 @@ class LogNCDE(eqx.Module):
     signature_window_size: int = eqx.field(static=True)
     evolving_out: bool
 
+    # Extrapolation scheme
+    extrapolation_scheme: ExtrapolationScheme | None = eqx.field(static=True)
+    n_recon: int | None = eqx.field(static=True)
+
+    solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
+    stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
+    adjoint: diffrax.AbstractAdjoint = eqx.field(static=True)
+
     def __init__(
         self,
         input_path_dim: int,
@@ -96,7 +111,14 @@ class LogNCDE(eqx.Module):
         signature_window_size: int,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] | None = None,
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
+        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
+            rtol=1e-2, atol=1e-3, dtmin=1e-6
+        ),
+        adjoint: diffrax.AbstractAdjoint | None = None,
         evolving_out: bool = True,
+        extrapolation_scheme: ExtrapolationScheme | None = None,
+        n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
         self.shuffle_hopf_algebra = ShuffleHopfAlgebra.build(
@@ -130,33 +152,95 @@ class LogNCDE(eqx.Module):
         self.signature_depth = signature_depth
         self.signature_window_size = signature_window_size
         self.evolving_out = evolving_out
+        self.extrapolation_scheme = extrapolation_scheme
+        self.n_recon = n_recon
+        self.solver = solver
+        self.stepsize_controller = stepsize_controller
+        self.adjoint = (
+            diffrax.RecursiveCheckpointAdjoint() if adjoint is None else adjoint
+        )
 
-    def __call__(
-        self,
-        ts: jax.Array,
-        coeffs: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    def _forward_with_control(
+        self, ts: jax.Array, control: diffrax.AbstractPath
     ) -> jax.Array:
-        control = diffrax.CubicInterpolation(ts, coeffs)
         x0 = control.evaluate(ts[0])
         h0 = self.initial(x0)
-        log_signatures = compute_windowed_logsignatures(
+        log_signatures = compute_windowed_logsignatures_from_control(
             ts,
             control,
             self.shuffle_hopf_algebra,
             int(self.signature_depth),
             int(self.signature_window_size),
-            False,
         )
+        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
+        logsig_size = int(log_signatures.shape[-1])
+        z0 = jnp.zeros((1, logsig_size), dtype=log_signatures.dtype)
+        z = jnp.concatenate([z0, jnp.cumsum(log_signatures, axis=0)], axis=0)
+        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
 
-        def step(
-            h: jax.Array,
-            log_signature: LogSignature,
-        ) -> tuple[jax.Array, jax.Array]:
-            new_h = self.cde_func(h, log_signature)
-            return new_h, new_h
+        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
+        saveat = diffrax.SaveAt(ts=ts)
+        solution = diffrax.diffeqsolve(
+            terms=term,
+            solver=self.solver,
+            t0=ts[0],
+            t1=ts[-1],
+            dt0=None,
+            y0=h0,
+            stepsize_controller=self.stepsize_controller,
+            saveat=saveat,
+            adjoint=self.adjoint,
+        )
+        assert solution.ys is not None
+        return solution.ys
 
-        _, h_history = jax.lax.scan(step, h0, log_signatures)
-        hidden_over_time = jnp.concatenate([h0[None, :], h_history], axis=0)
+    def _forward_with_values(
+        self, ts: jax.Array, control_values: jax.Array
+    ) -> jax.Array:
+        x0 = control_values[0]
+        h0 = self.initial(x0)
+
+        log_signatures = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.shuffle_hopf_algebra,
+            int(self.signature_depth),
+            int(self.signature_window_size),
+        )
+        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
+        logsig_size = int(log_signatures.shape[-1])
+        z0 = jnp.zeros((1, logsig_size), dtype=log_signatures.dtype)
+        z = jnp.concatenate([z0, jnp.cumsum(log_signatures, axis=0)], axis=0)
+        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+
+        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
+        saveat = diffrax.SaveAt(ts=ts)
+        solution = diffrax.diffeqsolve(
+            terms=term,
+            solver=self.solver,
+            t0=ts[0],
+            t1=ts[-1],
+            dt0=None,
+            y0=h0,
+            stepsize_controller=self.stepsize_controller,
+            saveat=saveat,
+            adjoint=self.adjoint,
+        )
+        assert solution.ys is not None
+        return solution.ys
+
+    def __call__(
+        self,
+        ts: jax.Array,
+        x: jax.Array,
+    ) -> jax.Array:
+        if self.extrapolation_scheme is not None:
+            assert self.n_recon is not None, (
+                "n_recon must be set when using extrapolation_scheme"
+            )
+            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            hidden_over_time = self._forward_with_control(ts, control)
+        else:
+            hidden_over_time = self._forward_with_values(ts, x)
 
         if self.evolving_out:
 
