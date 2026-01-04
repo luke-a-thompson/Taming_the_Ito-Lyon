@@ -1,5 +1,4 @@
 import jax
-import jax.numpy as jnp
 import equinox as eqx
 
 from taming_the_ito_lyon.models import Model
@@ -7,80 +6,25 @@ import optax
 from typing import Callable
 
 
-def mse_loss(
-    pred: jax.Array,
-    target: jax.Array,
-) -> jax.Array:
-    return jnp.mean((pred - target) ** 2)
-
-
-def rotational_geodesic_loss(
-    pred: jax.Array,
-    target: jax.Array,
-) -> jax.Array:
-    """
-    Compute the Rotational Geodesic Error (RGE) loss.
-    RGE(R1, R2) = 2 * arcsin(||R2 - R1||_F / (2√2))
-
-    Args:
-        pred: Predicted rotation matrices
-        target: Target rotation matrices
-
-    Returns:
-        Mean RGE loss
-    """
-    assert pred.shape == target.shape, "pred and target must have the same shape"
-    assert pred.shape[-1] == pred.shape[-2], "pred and target must be square matrices"
-    frobenius_norm = jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1))
-    rge = 2.0 * jnp.arcsin(frobenius_norm / (2.0 * jnp.sqrt(2.0)))
-    return jnp.mean(rge)
-
-
-def make_sigker_loss(
-    order: int = 5,
-    static_kernel: str = "linear",
-    solver: str = "monomial_approx",
-    max_batch: int = 100,
-) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """
-    Create a signature-kernel MMD loss that instantiates SigKernel once.
-
-    This is the non-adversarial objective: match the *distribution* of paths
-    via MMD between two batches of sample paths.
-    """
-    from polysigkernel import SigKernel
-
-    signature_kernel = SigKernel(
-        order=order,
-        static_kernel=static_kernel,
-        solver=solver,
-    )
-
-    def loss(pred: jax.Array, target: jax.Array) -> jax.Array:
-        return signature_kernel.compute_mmd(pred, target, max_batch=max_batch)
-
-    return loss
-
-
 @eqx.filter_jit
-def batch_loss(
+def batch_loss_conditional(
     model: Model,
     ts_b: jax.Array,
     target_b: jax.Array,
     x_b: jax.Array,
     loss_fn: Callable[[jax.Array, jax.Array], jax.Array],
 ) -> jax.Array:
-    def predict_path(
-        ts_i: jax.Array,
-        x_i: jax.Array,
-    ) -> jax.Array:
+    """
+    Compute the loss for a batch of data where the model is conditioned on the control values.
+    """
+    def predict(ts_i: jax.Array, x_i: jax.Array) -> jax.Array:
         return model(ts_i, x_i)
 
-    preds = jax.vmap(predict_path)(ts_b, x_b)
+    preds = jax.vmap(predict)(ts_b, x_b)
     return loss_fn(preds, target_b)
 
 
-grad_fn = eqx.filter_value_and_grad(batch_loss)
+grad_fn = eqx.filter_value_and_grad(batch_loss_conditional)
 
 
 def train_epoch(
@@ -128,4 +72,4 @@ def eval_epoch(
     drivers_b: jax.Array,
     loss_fn: Callable[[jax.Array, jax.Array], jax.Array],
 ) -> float:
-    return float(batch_loss(model, timestep_b, solution_b, drivers_b, loss_fn))
+    return float(batch_loss_conditional(model, timestep_b, solution_b, drivers_b, loss_fn))

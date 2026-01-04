@@ -20,6 +20,8 @@ from taming_the_ito_lyon.models.extrapolation import (
 )
 from taming_the_ito_lyon.config import DATASETS
 from taming_the_ito_lyon.data.datasets import prepare_dataset
+from typing import Callable, Literal
+import equinox as eqx
 
 
 def _maybe_create_extrapolation_scheme(
@@ -184,3 +186,20 @@ def create_dataset(
     npz_path = DATASETS[dataset_name]["npz_path"]
     ts_batched, solution, control_values = prepare_dataset(npz_path)
     return ts_batched, solution, control_values
+
+
+def create_grad_fn(
+    loss_fn: Callable[[jax.Array, jax.Array], jax.Array],
+    mode: Literal["conditional", "unconditional"],
+):
+    """
+    Create a gradient function for the given loss function and mode.
+    """
+    if mode == "conditional":
+        from taming_the_ito_lyon.training.train import batch_loss_conditional
+
+        return eqx.filter_value_and_grad(batch_loss_conditional)
+    else:
+        from taming_the_ito_lyon.training.train import batch_loss_unconditional
+
+        return eqx.filter_value_and_grad(batch_loss_unconditional)

@@ -30,6 +30,6 @@ out_size = 1
 
 # Log-signature configuration
 signature_depth = 2
-signature_window_size = 32
+signature_window_size = 16
 
-hopf_algebra = "mkw"
+hopf_algebra = "shuffle"

@@ -13,9 +13,6 @@ import time
 from taming_the_ito_lyon.training.train import (
     train_epoch,
     eval_epoch,
-    mse_loss,
-    rotational_geodesic_loss,
-    make_sigker_loss,
 )
 from taming_the_ito_lyon.training.factories import (
     create_model,
@@ -31,6 +28,11 @@ from taming_the_ito_lyon.config import (
 )
 from taming_the_ito_lyon.config.config_options import LossType
 from taming_the_ito_lyon.models import Model
+from taming_the_ito_lyon.training.losses import (
+    mse_loss,
+    rotational_geodesic_loss,
+    make_sigker_loss,
+)
 
 SAVED_MODELS_DIR = "saved_models"
 

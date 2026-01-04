@@ -12,7 +12,7 @@ from .extrapolation import (
     create_scheme,
 )
 
-type Model = NeuralCDE | LogNCDE | NeuralRDE | MNDRE | GRU
+Model = NeuralCDE | LogNCDE | NeuralRDE | MNDRE | GRU
 
 __all__ = [
     "Model",
