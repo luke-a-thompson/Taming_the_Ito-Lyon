@@ -12,9 +12,9 @@ import diffrax
 
 from stochastax.hopf_algebras import ShuffleHopfAlgebra
 from .logsignatures import (
-    compute_disjoint_signature_times,
     compute_windowed_logsignatures_from_values,
 )
+from .logsig_cde_solve import solve_cde_from_windowed_logsigs
 
 
 class NRDEFunc(eqx.Module):
@@ -160,26 +160,15 @@ class NeuralRDE(eqx.Module):
             self.signature_depth,
             self.signature_window_size,
         )  # (num_windows, logsig_size)
-        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
-        logsig_size = int(logsigs.shape[-1])
-        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
-        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
-        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
-
-        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
-        saveat = diffrax.SaveAt(ts=ts)
-        solution = diffrax.diffeqsolve(
-            terms=term,
-            solver=self.solver,
-            t0=ts[0],
-            t1=ts[-1],
-            dt0=None,
+        return solve_cde_from_windowed_logsigs(
+            ts,
+            logsigs,
+            signature_window_size=int(self.signature_window_size),
+            cde_func=self.cde_func,
             y0=h0,
+            solver=self.solver,
             stepsize_controller=self.stepsize_controller,
-            saveat=saveat,
         )
-        assert solution.ys is not None
-        return solution.ys
 
     def __call__(
         self,

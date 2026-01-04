@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import diffrax
 import jax
 import jax.numpy as jnp
 
@@ -122,37 +121,3 @@ def compute_windowed_logsignatures_from_values(
     num_windows = (num_points - 1 + step - 1) // step
     indices = (jnp.arange(num_windows, dtype=jnp.int32) * step).astype(jnp.int32)
     return jax.vmap(window_logsig)(indices)
-
-
-def compute_windowed_logsignatures_from_control(
-    ts: jax.Array,
-    control: diffrax.AbstractPath,
-    hopf_algebra: HopfAlgebra,
-    signature_depth: int,
-    signature_window_size: int,
-) -> jax.Array:
-    """Compute disjoint windowed log-signatures (flattened) along a control path.
-
-    Parameters
-    ----------
-    ts:
-        Shape (T,). Monotonically increasing timestamps.
-    control:
-        A `diffrax.AbstractPath` compatible object (e.g. `CubicInterpolation`).
-    hopf_algebra:
-        A Hopf algebra: ShuffleHopfAlgebra, GLHopfAlgebra, or MKWHopfAlgebra.
-    signature_depth:
-        Truncation depth for the log-signature.
-    signature_window_size:
-        Number of *intervals* per (disjoint) window. Each window is represented using
-        `signature_window_size + 1` points, and windows start at indices
-        `0, signature_window_size, 2*signature_window_size, ...`.
-    """
-    eval_fn = jax.vmap(control.evaluate)
-    values = eval_fn(ts)  # (T, C)
-    return compute_windowed_logsignatures_from_values(
-        values,
-        hopf_algebra,
-        signature_depth,
-        signature_window_size,
-    )

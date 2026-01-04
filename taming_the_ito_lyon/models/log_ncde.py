@@ -16,10 +16,9 @@ from stochastax.vector_field_lifts.split_vector_fields import split_multi_vector
 from stochastax.hopf_algebras import ShuffleHopfAlgebra
 from .extrapolation import ExtrapolationScheme
 from .logsignatures import (
-    compute_disjoint_signature_times,
-    compute_windowed_logsignatures_from_control,
     compute_windowed_logsignatures_from_values,
 )
+from .logsig_cde_solve import solve_cde_from_windowed_logsigs
 
 
 class LogNCDEFunc(eqx.Module):
@@ -96,7 +95,6 @@ class LogNCDE(eqx.Module):
 
     solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
     stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
-    adjoint: diffrax.AbstractAdjoint = eqx.field(static=True)
 
     def __init__(
         self,
@@ -115,7 +113,6 @@ class LogNCDE(eqx.Module):
         stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
             rtol=1e-2, atol=1e-3, dtmin=1e-6
         ),
-        adjoint: diffrax.AbstractAdjoint | None = None,
         evolving_out: bool = True,
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
@@ -156,77 +153,46 @@ class LogNCDE(eqx.Module):
         self.n_recon = n_recon
         self.solver = solver
         self.stepsize_controller = stepsize_controller
-        self.adjoint = (
-            diffrax.RecursiveCheckpointAdjoint() if adjoint is None else adjoint
+
+    def _forward_from_logsigs(
+        self, ts: jax.Array, x0: jax.Array, log_signatures: jax.Array
+    ) -> jax.Array:
+        """Solve the induced CDE given initial input `x0` and disjoint window log-signatures."""
+        h0 = self.initial(x0)
+        return solve_cde_from_windowed_logsigs(
+            ts,
+            log_signatures,
+            signature_window_size=int(self.signature_window_size),
+            cde_func=self.cde_func,
+            y0=h0,
+            solver=self.solver,
+            stepsize_controller=self.stepsize_controller,
         )
 
     def _forward_with_control(
         self, ts: jax.Array, control: diffrax.AbstractPath
     ) -> jax.Array:
         x0 = control.evaluate(ts[0])
-        h0 = self.initial(x0)
-        log_signatures = compute_windowed_logsignatures_from_control(
-            ts,
-            control,
-            self.shuffle_hopf_algebra,
-            int(self.signature_depth),
-            int(self.signature_window_size),
-        )
-        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
-        logsig_size = int(log_signatures.shape[-1])
-        z0 = jnp.zeros((1, logsig_size), dtype=log_signatures.dtype)
-        z = jnp.concatenate([z0, jnp.cumsum(log_signatures, axis=0)], axis=0)
-        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
-
-        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
-        saveat = diffrax.SaveAt(ts=ts)
-        solution = diffrax.diffeqsolve(
-            terms=term,
-            solver=self.solver,
-            t0=ts[0],
-            t1=ts[-1],
-            dt0=None,
-            y0=h0,
-            stepsize_controller=self.stepsize_controller,
-            saveat=saveat,
-            adjoint=self.adjoint,
-        )
-        assert solution.ys is not None
-        return solution.ys
-
-    def _forward_with_values(
-        self, ts: jax.Array, control_values: jax.Array
-    ) -> jax.Array:
-        x0 = control_values[0]
-        h0 = self.initial(x0)
-
+        control_values = jax.vmap(control.evaluate)(ts)
         log_signatures = compute_windowed_logsignatures_from_values(
             control_values,
             self.shuffle_hopf_algebra,
             int(self.signature_depth),
             int(self.signature_window_size),
         )
-        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
-        logsig_size = int(log_signatures.shape[-1])
-        z0 = jnp.zeros((1, logsig_size), dtype=log_signatures.dtype)
-        z = jnp.concatenate([z0, jnp.cumsum(log_signatures, axis=0)], axis=0)
-        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+        return self._forward_from_logsigs(ts, x0, log_signatures)
 
-        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
-        saveat = diffrax.SaveAt(ts=ts)
-        solution = diffrax.diffeqsolve(
-            terms=term,
-            solver=self.solver,
-            t0=ts[0],
-            t1=ts[-1],
-            dt0=None,
-            y0=h0,
-            stepsize_controller=self.stepsize_controller,
-            saveat=saveat,
-            adjoint=self.adjoint,
+    def _forward_with_values(
+        self, ts: jax.Array, control_values: jax.Array
+    ) -> jax.Array:
+        x0 = control_values[0]
+        log_signatures = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.shuffle_hopf_algebra,
+            int(self.signature_depth),
+            int(self.signature_window_size),
         )
-        assert solution.ys is not None
-        return solution.ys
+        return self._forward_from_logsigs(ts, x0, log_signatures)
 
     def __call__(
         self,

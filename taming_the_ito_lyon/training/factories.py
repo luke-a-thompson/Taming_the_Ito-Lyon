@@ -15,8 +15,41 @@ from taming_the_ito_lyon.models import (
     MNDRE,
     create_scheme,
 )
+from taming_the_ito_lyon.models.extrapolation import (
+    ExtrapolationScheme as ExtrapolationSchemeProtocol,
+)
 from taming_the_ito_lyon.config import DATASETS
 from taming_the_ito_lyon.data.datasets import prepare_dataset
+
+
+def _maybe_create_extrapolation_scheme(
+    config: Config,
+    *,
+    input_path_dim: int,
+    key: jax.Array,
+) -> tuple[jax.Array, ExtrapolationSchemeProtocol | None]:
+    """Optionally create an extrapolation scheme and (if needed) split the PRNG key."""
+
+    if not config.experiment_config.use_extrapolation:
+        return key, None
+
+    # Only these models currently accept extrapolation parameters.
+    if not isinstance(config.nn_config, (NCDEConfig, LogNCDEConfig, MNRDEConfig)):
+        return key, None
+
+    scheme_enum = config.experiment_config.extrapolation_scheme
+    n_recon = config.experiment_config.n_recon
+    assert scheme_enum is not None
+    assert n_recon is not None
+
+    model_key, scheme_key = jax.random.split(key)
+    extrapolation_scheme = create_scheme(
+        scheme_enum.value,
+        num_points=n_recon,
+        input_dim=input_path_dim,
+        key=scheme_key,
+    )
+    return model_key, extrapolation_scheme
 
 
 def create_model(
@@ -26,19 +59,11 @@ def create_model(
     output_path_dim: int,
     key: jax.Array,
 ) -> NeuralCDE | LogNCDE | NeuralRDE | MNDRE:
+    model_key, extrapolation_scheme = _maybe_create_extrapolation_scheme(
+        config, input_path_dim=input_path_dim, key=key
+    )
     match config.nn_config:
         case NCDEConfig():
-            extrapolation_scheme = None
-            model_key = key
-            if config.experiment_config.use_extrapolation:
-                # Config validator ensures these are not None
-                model_key, scheme_key = jax.random.split(key)
-                extrapolation_scheme = create_scheme(
-                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
-                    num_points=config.experiment_config.n_recon,  # type: ignore
-                    input_dim=input_path_dim,
-                    key=scheme_key,
-                )
             return NeuralCDE(
                 input_path_dim=input_path_dim,
                 init_hidden_dim=config.nn_config.init_hidden_dim,
@@ -55,16 +80,6 @@ def create_model(
                 n_recon=config.experiment_config.n_recon,
             )
         case LogNCDEConfig():
-            extrapolation_scheme = None
-            model_key = key
-            if config.experiment_config.use_extrapolation:
-                model_key, scheme_key = jax.random.split(key)
-                extrapolation_scheme = create_scheme(
-                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
-                    num_points=config.experiment_config.n_recon,  # type: ignore
-                    input_dim=input_path_dim,
-                    key=scheme_key,
-                )
             return LogNCDE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
@@ -91,20 +106,6 @@ def create_model(
                 key=key,
             )
         case MNRDEConfig():
-            extrapolation_scheme = None
-
-            if config.experiment_config.use_extrapolation:
-                # Config validator ensures these are not None
-                model_key, scheme_key = jax.random.split(key)
-                extrapolation_scheme = create_scheme(
-                    config.experiment_config.extrapolation_scheme.value,  # type: ignore
-                    num_points=config.experiment_config.n_recon,  # type: ignore
-                    input_dim=input_path_dim,
-                    key=scheme_key,
-                )
-            else:
-                model_key = key
-
             return MNDRE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
@@ -159,7 +160,6 @@ def create_optimizer(
         case _:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-    # Chain gradient clipping if max_grad_norm is specified
     if max_grad_norm is not None:
         return optax.chain(
             optax.clip_by_global_norm(max_grad_norm),

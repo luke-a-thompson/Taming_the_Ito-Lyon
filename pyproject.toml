@@ -9,15 +9,17 @@ dependencies = [
     "diffrax>=0.7.0",
     "equinox>=0.13.2",
     "optax>=0.2.6",
+    "stochastax",
+    "polysigkernel",
     "numpy>=2.0.0",
     "pydantic>=2.12.3",
     "tqdm>=4.67.1",
-    "stochastax",
     "mypy>=1.18.2",
 ]
 
 [tool.uv.sources]
 stochastax = { git = "https://github.com/luke-a-thompson/Stochastax.git", branch = "master" }
+polysigkernel = { git = "https://github.com/FrancescoPiatti/polysigkernel.git", branch = "master" }
 
 [project.scripts]
 train = "taming_the_ito_lyon.training.train_cli:main"
@@ -27,9 +29,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-]
+dev = ["pytest>=9.0.2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["taming_the_ito_lyon"]

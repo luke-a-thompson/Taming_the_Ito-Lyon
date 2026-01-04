@@ -15,6 +15,7 @@ from taming_the_ito_lyon.training.train import (
     eval_epoch,
     mse_loss,
     rotational_geodesic_loss,
+    make_sigker_loss,
 )
 from taming_the_ito_lyon.training.factories import (
     create_model,
@@ -75,6 +76,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     loss_fn_map = {
         LossType.MSE: mse_loss,
         LossType.RGE: rotational_geodesic_loss,
+        LossType.SIGKER: make_sigker_loss(),
     }
     loss_fn = loss_fn_map[config.experiment_config.loss]
 

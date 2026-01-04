@@ -28,11 +28,10 @@ from stochastax.vector_field_lifts.vector_field_lift_types import (
 )
 from stochastax.manifolds import Manifold, EuclideanSpace
 from .logsignatures import (
-    compute_disjoint_signature_times,
-    compute_windowed_logsignatures_from_control,
     compute_windowed_logsignatures_from_values,
 )
 from .extrapolation import ExtrapolationScheme
+from .logsig_cde_solve import solve_cde_from_windowed_logsigs
 from taming_the_ito_lyon.config.config_options import HopfAlgebraType
 
 
@@ -226,6 +225,28 @@ class MNDRE(eqx.Module):
 
         return jax.vmap(apply_single)(hidden_states)
 
+    def _forward_from_logsigs(
+        self, ts: jax.Array, x0: jax.Array, logsigs: jax.Array
+    ) -> jax.Array:
+        """Solve the induced CDE given initial input `x0` and disjoint window log-signatures.
+
+        This is the shared core used by both:
+        - control-path mode (compute logsigs via `control.evaluate(ts)`), and
+        - value mode (compute logsigs directly from sampled values).
+        """
+        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
+
+        ys = solve_cde_from_windowed_logsigs(
+            ts,
+            logsigs,
+            signature_window_size=int(self.signature_window_size),
+            cde_func=self.cde_func,
+            y0=h0,
+            solver=self.solver,
+            stepsize_controller=self.stepsize_controller,
+        )
+        return jax.vmap(self.manifold.retract)(ys)
+
     def _forward_with_control(
         self,
         ts: jax.Array,
@@ -238,68 +259,27 @@ class MNDRE(eqx.Module):
         induced controlled differential equation with Diffrax.
         """
         x0 = control.evaluate(ts[0])
-        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
-        logsigs = compute_windowed_logsignatures_from_control(
-            ts,
-            control,
-            self.hopf_algebra,
-            self.signature_depth,
-            self.signature_window_size,
-        )
-        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
-        logsig_size = int(logsigs.shape[-1])
-        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
-        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
-        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
-
-        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
-        saveat = diffrax.SaveAt(ts=ts)
-        solution = diffrax.diffeqsolve(
-            terms=term,
-            solver=self.solver,
-            t0=ts[0],
-            t1=ts[-1],
-            dt0=None,
-            y0=h0,
-            stepsize_controller=self.stepsize_controller,
-            saveat=saveat,
-        )
-        assert solution.ys is not None
-        return jax.vmap(self.manifold.retract)(solution.ys)
-
-    def _forward_with_values(
-        self, ts: jax.Array, control_values: jax.Array
-    ) -> jax.Array:
-        """Core forward pass given sampled control values (standard mode fast path)."""
-        x0 = control_values[0]
-        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
-
+        control_values = jax.vmap(control.evaluate)(ts)
         logsigs = compute_windowed_logsignatures_from_values(
             control_values,
             self.hopf_algebra,
             self.signature_depth,
             self.signature_window_size,
         )
-        ts_sig = compute_disjoint_signature_times(ts, int(self.signature_window_size))
-        logsig_size = int(logsigs.shape[-1])
-        z0 = jnp.zeros((1, logsig_size), dtype=logsigs.dtype)
-        z = jnp.concatenate([z0, jnp.cumsum(logsigs, axis=0)], axis=0)
-        logsig_control = diffrax.LinearInterpolation(ts=ts_sig, ys=z)
+        return self._forward_from_logsigs(ts, x0, logsigs)
 
-        term = diffrax.ControlTerm(self.cde_func, logsig_control).to_ode()
-        saveat = diffrax.SaveAt(ts=ts)
-        solution = diffrax.diffeqsolve(
-            terms=term,
-            solver=self.solver,
-            t0=ts[0],
-            t1=ts[-1],
-            dt0=None,
-            y0=h0,
-            stepsize_controller=self.stepsize_controller,
-            saveat=saveat,
+    def _forward_with_values(
+        self, ts: jax.Array, control_values: jax.Array
+    ) -> jax.Array:
+        """Core forward pass given sampled control values (standard mode fast path)."""
+        x0 = control_values[0]
+        logsigs = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
         )
-        assert solution.ys is not None
-        return jax.vmap(self.manifold.retract)(solution.ys)
+        return self._forward_from_logsigs(ts, x0, logsigs)
 
     def __call__(
         self,

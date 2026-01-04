@@ -36,6 +36,32 @@ def rotational_geodesic_loss(
     return jnp.mean(rge)
 
 
+def make_sigker_loss(
+    order: int = 5,
+    static_kernel: str = "linear",
+    solver: str = "monomial_approx",
+    max_batch: int = 100,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """
+    Create a signature-kernel MMD loss that instantiates SigKernel once.
+
+    This is the non-adversarial objective: match the *distribution* of paths
+    via MMD between two batches of sample paths.
+    """
+    from polysigkernel import SigKernel
+
+    signature_kernel = SigKernel(
+        order=order,
+        static_kernel=static_kernel,
+        solver=solver,
+    )
+
+    def loss(pred: jax.Array, target: jax.Array) -> jax.Array:
+        return signature_kernel.compute_mmd(pred, target, max_batch=max_batch)
+
+    return loss
+
+
 @eqx.filter_jit
 def batch_loss(
     model: Model,
