@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from tqdm.auto import tqdm
+from taming_the_ito_lyon.config import Datasets
 
 
 def add_time_channel(values: jax.Array) -> jax.Array:
@@ -20,22 +21,60 @@ def add_time_channel(values: jax.Array) -> jax.Array:
     return jnp.concatenate([time_channel, values], axis=-1)
 
 
-def load_npz_dataset(npz_path: str) -> tuple[jax.Array, jax.Array]:
+def make_sliding_windows(
+    values: jax.Array,
+    ts: jax.Array,
+    *,
+    n_recon: int,
+    n_future: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
-    Load an NPZ dataset with keys 'solution' and 'driver' and return as JAX arrays.
-    Returns (solution, driver).
+    Construct disjoint sliding windows:
+      driver = seq[s : s+n_recon]
+      solution = seq[s : s+n_recon+n_future]
+    Returns:
+      ts_windows: (B * W, n_recon + n_future)
+      driver: (B * W, n_recon, C)
+      solution: (B * W, n_recon + n_future, C)
+    where W = T - (n_recon + n_future) + 1.
     """
-    data = np.load(npz_path)
-    solution_np = data["solution"]  # (B, T, C_sol)
-    driver_np = data["driver"]  # (B, T, C_drv)
-    # Use float32 to avoid slow float64 kernels/compilation on many GPUs
-    solution = jnp.asarray(solution_np, dtype=jnp.float32)
-    driver = jnp.asarray(driver_np, dtype=jnp.float32)
-    return solution, driver
+    total_len = int(n_recon + n_future)
+    if n_recon <= 0 or n_future <= 0:
+        raise ValueError(
+            f"n_recon and n_future must be positive, got n_recon={n_recon}, n_future={n_future}"
+        )
+
+    batch_size, length, channels = values.shape
+    if length < total_len:
+        raise ValueError(
+            f"Sequence too short for windowing: length={length}, n_recon+n_future={total_len}"
+        )
+
+    start_idx = jnp.arange(length - total_len + 1)  # (W,)
+    window_idx = start_idx[:, None] + jnp.arange(total_len)[None, :]  # (W, total_len)
+
+    ts_windows_single = ts[window_idx]  # (W, total_len)
+    ts_windows = jnp.repeat(ts_windows_single[None, :, :], batch_size, axis=0).reshape(
+        batch_size * ts_windows_single.shape[0],
+        total_len,
+    )
+
+    windows = jax.vmap(lambda seq: seq[window_idx], in_axes=0)(
+        values
+    )  # (B, W, total_len, C)
+    windows = windows.reshape(
+        batch_size * ts_windows_single.shape[0], total_len, channels
+    )
+
+    driver = windows[:, :n_recon, :]
+    solution = windows
+    return ts_windows, driver, solution
 
 
 def prepare_dataset(
-    npz_path: str,
+    dataset_name: Datasets,
+    n_recon: int | None = None,
+    n_future: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Load dataset with raw control values (including time channel).
@@ -46,20 +85,103 @@ def prepare_dataset(
         - solution: shape (B, T, C)
         - control_values: shape (B, T, C+1) - includes time channel
     """
-    solution, driver = load_npz_dataset(npz_path)
+    dataset_path = Datasets(dataset_name).value
+    data = np.load(dataset_path)
+
+    solution_np: np.ndarray | jax.Array
+    driver_np: np.ndarray | jax.Array
+
+    match dataset_name := Datasets(dataset_name):
+        case Datasets.OU_PROCESS | Datasets.ROUGH_OU_PROCESS:
+            solution_np = data["solution"]  # (B, T, C_sol)
+            driver_np = data["driver"]  # (B, T, C_drv)
+        case Datasets.BLACK_SCHOLES | Datasets.BERGOMI | Datasets.ROUGH_BERGOMI:
+            solution_np = data["solution"]  # (B, T, C_sol)
+            driver_np = data["driver"]  # (B, T, C_drv)
+            # Keep only the price (index 0) but preserve the channel axis.
+            # Example: (3000, 1001, 2) -> (3000, 1001, 1)
+            solution_np = solution_np[..., 0:1]
+            driver_np = driver_np[..., 0:1]
+        case Datasets.SG_SO3_SIMULATION:
+            # Simulation data has quarternion scalar last, so is scipy compatible
+            damping0_rotmat = data["R_sim_damped0"]
+            damping1_rotmat = data["R_sim_damped1"]
+            damping2_rotmat = data["R_sim_damped2"]
+            damping3_rotmat = data["R_sim_damped3"]
+            # Flatten 3x3 -> 9 so the model sees shape (B, T, 9)
+            rotmats = np.stack(
+                [damping0_rotmat, damping1_rotmat, damping2_rotmat, damping3_rotmat],
+                axis=2,
+            )
+            b, t, boxes, _, _ = rotmats.shape
+            rotmats = rotmats.reshape(b * boxes, t, 3, 3)
+            solution_np = rotmats.reshape(b * boxes, t, 9)
+            # For this dataset, the driver is the observed rotation sequence (per box)
+            driver_np = solution_np
+        case Datasets.OXFORD_MULTIMOTION_STATIC:
+            box1_rotmat = data["R_box1"]
+            box2_rotmat = data["R_box2"]
+            box3_rotmat = data["R_box3"]
+            box4_rotmat = data["R_box4"]
+            # Keep boxes as separate sequences by folding the box axis into the batch axis:
+            # (B, T, 4, 3, 3) -> (B*4, T, 3, 3) -> (B*4, T, 9)
+            rotmats = np.stack(
+                [box1_rotmat, box2_rotmat, box3_rotmat, box4_rotmat], axis=2
+            )
+            b, t, boxes, _, _ = rotmats.shape
+            rotmats = rotmats.reshape(b * boxes, t, 3, 3)
+            solution_np = rotmats.reshape(b * boxes, t, 9)
+            # For this dataset, the driver is the observed rotation sequence (per box)
+            driver_np = solution_np
+        case _:
+            raise ValueError(
+                f"Dataset not supported by prepare_dataset: {dataset_name}"
+            )
+
+    # Use float32 to avoid slow float64 kernels/compilation on many GPUs
+    solution = jnp.asarray(solution_np, dtype=jnp.float32)
+    driver = jnp.asarray(driver_np, dtype=jnp.float32)
+
+    # Time grid for the original (unwindowed) sequence.
+    batch_size, length, _ = driver.shape
+    ts_full = jnp.linspace(0.0, 1.0, length, dtype=driver.dtype)  # (T,)
+
+    # Sliding-window construction (applied to any dataset when both values are provided).
+    driver_recon: jax.Array | None = None
+    if n_recon is not None and n_future is not None:
+        ts_batched, driver_recon, solution = make_sliding_windows(
+            driver, ts_full, n_recon=n_recon, n_future=n_future
+        )
+    else:
+        ts_batched = jnp.broadcast_to(ts_full[None, :], (batch_size, length))
+
     tqdm.write(
         (
-            f"Loaded dataset from {npz_path}:\n"
+            f"Loaded dataset {dataset_name} from {dataset_path}:\n"
             f"  solution: dtype={solution.dtype}, shape=(batch={solution.shape[0]}, length={solution.shape[1]}, channels={solution.shape[2]})\n"
             f"  driver:   dtype={driver.dtype}, shape=(batch={driver.shape[0]}, length={driver.shape[1]}, channels={driver.shape[2]})"
         )
     )
 
-    batch_size, length, _ = driver.shape
-    ts = jnp.linspace(0.0, 1.0, length, dtype=driver.dtype)
-    ts_batched = jnp.broadcast_to(ts[None, :], (batch_size, length))
-
-    control_values = add_time_channel(driver)
+    # Control values include a time channel.
+    # In extrapolation/windowing mode we return ONLY the reconstruction control values:
+    # (ts_recon, driver_recon). Future timestamps remain available in `ts_batched`,
+    # but no dummy future driver values are provided.
+    if n_recon is not None and n_future is not None:
+        assert driver_recon is not None
+        ts_recon = ts_batched[:, : int(n_recon)]
+        time_channel = ts_recon[:, :, None]
+        control_values = jnp.concatenate([time_channel, driver_recon], axis=-1)
+    elif n_recon is not None:
+        # Backwards-compatible behavior if a caller provides n_recon without n_future.
+        # (This should usually be prevented by config validation.)
+        ts_recon = ts_batched[:, : int(n_recon)]
+        time_channel = ts_recon[:, :, None]
+        control_values = jnp.concatenate(
+            [time_channel, driver[:, : int(n_recon)]], axis=-1
+        )
+    else:
+        control_values = add_time_channel(driver)
     return ts_batched, solution, control_values
 
 
@@ -68,9 +190,10 @@ def split_train_val_test(
     solution: jax.Array,
     control_values: jax.Array,
     *,
-    train_fraction: float = 0.6,
-    val_fraction: float = 0.2,
-    test_fraction: float = 0.2,
+    key: jax.Array,
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -83,7 +206,8 @@ def split_train_val_test(
     jax.Array,
 ]:
     """
-    Split dataset into train/val/test along the batch dimension.
+    Split dataset into train/val/test along the batch dimension, using a random
+    permutation of the batch indices.
 
     Returns:
         (ts_train, target_train, control_train,
@@ -107,20 +231,24 @@ def split_train_val_test(
     val_size = max(0, min(val_size, max(0, batch_count - train_size)))
     test_size = max(0, batch_count - train_size - val_size)
 
-    ts_train = ts_batched[:train_size]
-    target_train = solution[:train_size]
-    control_train = control_values[:train_size]
+    indices = jnp.arange(batch_count)
+    perm = jr.permutation(key, indices)
 
-    ts_val = ts_batched[train_size : train_size + val_size]
-    target_val = solution[train_size : train_size + val_size]
-    control_val = control_values[train_size : train_size + val_size]
+    train_idx = perm[:train_size]
+    val_idx = perm[train_size : train_size + val_size]
+    test_idx = perm[train_size + val_size : train_size + val_size + test_size]
 
-    ts_test = ts_batched[train_size + val_size : train_size + val_size + test_size]
-    target_test = solution[train_size + val_size : train_size + val_size + test_size]
-    control_test = control_values[
-        train_size + val_size : train_size + val_size + test_size
-    ]
+    ts_train = ts_batched[train_idx]
+    target_train = solution[train_idx]
+    control_train = control_values[train_idx]
 
+    ts_val = ts_batched[val_idx]
+    target_val = solution[val_idx]
+    control_val = control_values[val_idx]
+
+    ts_test = ts_batched[test_idx]
+    target_test = solution[test_idx]
+    control_test = control_values[test_idx]
     return (
         ts_train,
         target_train,
@@ -134,10 +262,13 @@ def split_train_val_test(
     )
 
 
+Dataloader = Generator[tuple[jax.Array, jax.Array, jax.Array], None, Never]
+
+
 def make_dataloader(
     timestep: jax.Array,
     solution: jax.Array,
-    control_values: jax.Array,
+    control_values: jax.Array | None,
     batch_size: int,
     *,
     key: jax.Array,
@@ -148,7 +279,9 @@ def make_dataloader(
     Args:
         timestep: shape (N, T)
         solution: shape (N, T, C)
-        control_values: shape (N, T, C+1) - raw control values with time channel
+        control_values: optional. If provided, shape (N, T, C+1) - raw control values
+            with time channel. If None, the dataloader yields an empty placeholder
+            array for the third component.
         batch_size: minibatch size
         key: random key for shuffling
 
@@ -167,5 +300,8 @@ def make_dataloader(
             batch_idx = perm[start:end]
             ts_b = timestep[batch_idx]
             sol_b = solution[batch_idx]
-            control_b = control_values[batch_idx]
+            if control_values is None:
+                control_b = jnp.empty((end - start, 0), dtype=sol_b.dtype)
+            else:
+                control_b = control_values[batch_idx]
             yield ts_b, sol_b, control_b

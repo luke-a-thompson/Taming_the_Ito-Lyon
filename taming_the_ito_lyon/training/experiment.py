@@ -2,6 +2,7 @@ import atexit
 import json
 import jax
 import jax.random as jr
+import jax.numpy as jnp
 import equinox as eqx
 from datetime import datetime
 from tqdm.auto import tqdm
@@ -9,30 +10,26 @@ import os
 import shutil
 import signal
 import time
+from collections.abc import Callable
 
-from taming_the_ito_lyon.training.train import (
-    train_epoch,
-    eval_epoch,
+import optax
+from cyreal.loader import DataLoader
+from taming_the_ito_lyon.training.results_gathering_fns import (
+    get_rough_volatility_results,
 )
 from taming_the_ito_lyon.training.factories import (
     create_model,
     create_optimizer,
-    create_dataset,
-)
-from taming_the_ito_lyon.data import (
-    split_train_val_test,
-    make_dataloader,
+    create_dataloaders,
+    create_unconditional_control_sampler_batched,
+    create_grad_batch_loss_fns,
+    configure_jax,
 )
 from taming_the_ito_lyon.config import (
     Config,
 )
-from taming_the_ito_lyon.config.config_options import LossType
+from taming_the_ito_lyon.config.config_options import TrainingMode
 from taming_the_ito_lyon.models import Model
-from taming_the_ito_lyon.training.losses import (
-    mse_loss,
-    rotational_geodesic_loss,
-    make_sigker_loss,
-)
 
 SAVED_MODELS_DIR = "saved_models"
 
@@ -46,17 +43,39 @@ def _get_run_dirname(model_name: str) -> str:
 
 
 def experiment(config: Config, config_path: str | None = None) -> None:
+    configure_jax()
     model_name = config.experiment_config.model_type.value
-    key = jr.PRNGKey(config.experiment_config.seed)
-    model_key, loader_key = jr.split(key, 2)
+    loss_label: str = str(config.experiment_config.loss.value)
+    model_key, loader_key = jr.split(jr.PRNGKey(config.experiment_config.seed), 2)
+    mode = config.experiment_config.training_mode
 
-    ts_batched, solution, control_values = create_dataset(config=config)
-    batch_count, length, target_channels = solution.shape
-    data_channels = int(control_values[0].shape[-1])
+    train_loader, val_loader, test_loader = create_dataloaders(config=config)
+    train_loader_state = train_loader.init_state(loader_key)
+    val_loader_state = val_loader.init_state(loader_key)
+    test_loader_state = test_loader.init_state(loader_key)
+
+    train_iterate = jax.jit(train_loader.next)
+    val_iterate = jax.jit(val_loader.next)
+    test_iterate = jax.jit(test_loader.next)
+
+    # Get shapes
+    shape_batch, _, _ = test_iterate(test_loader_state)
+
+    batch_size, timesteps, input_channels = shape_batch["driver"].shape
+    target_channels = shape_batch["solution"].shape[-1]
+    ts_full = jnp.linspace(0.0, 1.0, timesteps, dtype=shape_batch["solution"].dtype)
+
+    if mode == TrainingMode.UNCONDITIONAL:
+        # Model consumes (time + sampled driver channels)
+        uncond_dim = config.experiment_config.unconditional_driver_dim
+        assert uncond_dim is not None
+        input_path_dim = int(uncond_dim) + 1
+    else:
+        input_path_dim = input_channels
 
     model = create_model(
         config=config,
-        input_path_dim=data_channels,
+        input_path_dim=input_path_dim,
         output_path_dim=target_channels,
         key=model_key,
     )
@@ -74,43 +93,55 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
-    # Select loss function
-    loss_fn_map = {
-        LossType.MSE: mse_loss,
-        LossType.RGE: rotational_geodesic_loss,
-        LossType.SIGKER: make_sigker_loss(),
-    }
-    loss_fn = loss_fn_map[config.experiment_config.loss]
+    unconditional_control_sampler = None
+    if mode == TrainingMode.UNCONDITIONAL:
+        uncond_dim = config.experiment_config.unconditional_driver_dim
+        assert uncond_dim is not None
+        assert config.experiment_config.unconditional_driver_kind is not None
+        assert config.experiment_config.unconditional_hurst is not None
+        unconditional_control_sampler = create_unconditional_control_sampler_batched(
+            driver_kind=config.experiment_config.unconditional_driver_kind,
+            driver_dim=int(uncond_dim),
+            hurst=float(config.experiment_config.unconditional_hurst),
+        )
 
-    (
-        ts_train,
-        target_train,
-        control_values_train,
-        ts_val,
-        target_val,
-        control_values_val,
-        ts_test,
-        target_test,
-        control_values_test,
-    ) = split_train_val_test(
-        ts_batched,
-        solution,
-        control_values,
-        train_fraction=config.experiment_config.train_fraction,
-        val_fraction=config.experiment_config.val_fraction,
-        test_fraction=config.experiment_config.test_fraction,
+    grad_fn, batch_loss_fn = create_grad_batch_loss_fns(
+        loss_type=config.experiment_config.loss,
+        output_path_dim=int(target_channels),
     )
 
-    batch_size = int(config.experiment_config.batch_size)
-    num_batches = (ts_train.shape[0] + batch_size - 1) // batch_size
+    @eqx.filter_jit(donate="all")
+    def train_step(
+        control_values_b: jax.Array,
+        target_b: jax.Array,
+        model: Model,
+        opt_state: optax.OptState,
+    ) -> tuple[jax.Array, Model, optax.OptState]:
+        loss_value, grads = grad_fn(model, control_values_b, target_b)
+        params = eqx.filter(model, eqx.is_inexact_array)
+        updates, new_opt_state = optim.update(grads, opt_state, params)
+        updated_model: Model = eqx.apply_updates(model, updates)
+        return loss_value, updated_model, new_opt_state
 
-    loader = make_dataloader(
-        timestep=ts_train,
-        solution=target_train,
-        control_values=control_values_train,
-        batch_size=batch_size,
-        key=loader_key,
-    )
+    @eqx.filter_jit
+    def eval_step(
+        control_values_b: jax.Array,
+        target_b: jax.Array,
+        model: Model,
+    ) -> jax.Array:
+        return batch_loss_fn(model, control_values_b, target_b)
+
+    @eqx.filter_jit
+    def predict_batch(control_values_b: jax.Array, model: Model) -> jax.Array:
+        return jax.vmap(model)(control_values_b)
+
+    train_key = None
+    val_key = None
+    test_key = None
+    if mode == TrainingMode.UNCONDITIONAL:
+        train_key = jr.PRNGKey(config.experiment_config.seed + 1)
+        val_key = jr.PRNGKey(config.experiment_config.seed + 2)
+        test_key = jr.PRNGKey(config.experiment_config.seed + 3)
 
     # Setup temporary checkpoint path
     os.makedirs(SAVED_MODELS_DIR, exist_ok=True)
@@ -129,7 +160,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     signal.signal(signal.SIGINT, sigint_handler)
     atexit.register(cleanup_temp)
 
-    best_val_loss = float("inf")
+    best_val_metric = float("inf")
     min_train_loss = float("inf")
     best_epoch = -1
     epochs_since_improve = 0
@@ -139,35 +170,155 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     training_start = time.perf_counter()
     final_epoch = 0
 
-    epoch_bar = tqdm(range(epochs), desc="Epochs", position=0, leave=True)
+    def train_epoch(
+        model: Model,
+        opt_state: optax.OptState,
+        training_mode: TrainingMode,
+        epoch_key: jax.Array | None,
+        epoch_idx: int,
+    ) -> tuple[float, Model, optax.OptState]:
+        nonlocal train_loader_state
+        total_loss = 0.0
+        pbar = tqdm(
+            range(train_loader.steps_per_epoch),
+            desc="Training batches",
+            position=1,
+            leave=False,
+        )
+        for step_idx in pbar:
+            data_time = time.perf_counter()
+            batch, train_loader_state, _ = train_iterate(train_loader_state)
+
+            # Get control values based on mode
+            if training_mode == TrainingMode.UNCONDITIONAL:
+                if epoch_key is None or unconditional_control_sampler is None:
+                    raise ValueError(
+                        "epoch_key and unconditional_control_sampler required for UNCONDITIONAL"
+                    )
+                step_key = jr.fold_in(jr.fold_in(epoch_key, epoch_idx), step_idx)
+                control_values_b = unconditional_control_sampler(
+                    ts_full, step_key, batch_size
+                )
+            else:
+                control_values_b = batch["driver"]
+
+            data_time_elapsed = time.perf_counter() - data_time
+            train_time = time.perf_counter()
+            loss_value, model, opt_state = train_step(
+                control_values_b,
+                batch["solution"],
+                model,
+                opt_state,
+            )
+            total_loss += float(loss_value)
+            train_time_elapsed = time.perf_counter() - train_time
+            pbar.set_postfix(
+                {
+                    f"train_{loss_label}": f"{float(loss_value) * 1e2:.3f}×10⁻²",
+                    "data_time": f"{data_time_elapsed:.2f}s",
+                    "train_time": f"{train_time_elapsed:.2f}s",
+                }
+            )
+
+        avg_loss = total_loss / max(1, int(train_loader.steps_per_epoch))
+        return avg_loss, model, opt_state
+
+    def eval_epoch(
+        model: Model,
+        loader: DataLoader,
+        iterate: Callable[[object], tuple[dict[str, jax.Array], object, jax.Array]],
+        loader_state: object,
+        epoch_key: jax.Array | None,
+        epoch_idx: int,
+        compute_predictions: bool = False,
+    ) -> tuple[float, object | None]:
+        total_loss = 0.0
+        preds_batches: list[jax.Array] = []
+        targets_batches: list[jax.Array] = []
+
+        pbar = tqdm(
+            range(loader.steps_per_epoch),
+            desc="Evaluating batches",
+            position=1,
+            leave=False,
+        )
+        for step_idx in pbar:
+            batch, loader_state, _ = iterate(loader_state)
+
+            # Get control values based on mode
+            if mode == TrainingMode.UNCONDITIONAL:
+                if epoch_key is None or unconditional_control_sampler is None:
+                    raise ValueError(
+                        "epoch_key and unconditional_control_sampler required for UNCONDITIONAL"
+                    )
+                step_key = jr.fold_in(jr.fold_in(epoch_key, epoch_idx), step_idx)
+                control_values_b = unconditional_control_sampler(
+                    ts_full, step_key, batch_size
+                )
+            else:
+                control_values_b = batch["driver"]
+
+            total_loss += float(eval_step(control_values_b, batch["solution"], model))
+
+            if compute_predictions:
+                preds_batches.append(predict_batch(control_values_b, model))
+                targets_batches.append(batch["solution"])
+
+        avg_loss = total_loss / max(1, int(loader.steps_per_epoch))
+
+        # Compute KS test if predictions were collected
+        if compute_predictions and preds_batches:
+            ks_result = get_rough_volatility_results(
+                preds_batches,
+                targets_batches,
+                epoch_idx,
+                ks_time_steps=[-1],
+                n_plot=batch_size,
+            )
+            eval_metric = ks_result if ks_result is not None else avg_loss
+        else:
+            eval_metric = avg_loss
+        return eval_metric, loader_state
+
+    epoch_bar = tqdm(
+        range(epochs),
+        desc="Epochs",
+        position=0,
+        leave=True,
+    )
     for epoch_idx in epoch_bar:
         final_epoch = epoch_idx
         train_loss, model, opt_state = train_epoch(
-            model=model,
-            optim=optim,
-            opt_state=opt_state,
-            loader=loader,
-            num_batches=num_batches,
-            loss_fn=loss_fn,
+            model, opt_state, mode, train_key, epoch_idx
         )
-
         min_train_loss = min(min_train_loss, train_loss)
-
-        val_loss_value = eval_epoch(
-            model, ts_val, target_val, control_values_val, loss_fn
+        val_metric, val_loader_state = eval_epoch(
+            model,
+            val_loader,
+            val_iterate,
+            val_loader_state,
+            val_key,
+            epoch_idx,
+            compute_predictions=True,
         )
-        if val_loss_value < best_val_loss:
-            best_val_loss = val_loss_value
+
+        if val_metric < best_val_metric:
+            best_val_metric = val_metric
             best_epoch = epoch_idx
             eqx.tree_serialise_leaves(temp_best_path, model)
             epochs_since_improve = 0
+            tqdm.write(
+                f"New best val metric: {val_metric:.3f} at epoch {epoch_idx}. Saving model."
+            )
         else:
             epochs_since_improve += 1
 
         epoch_bar.set_postfix(
-            train=f"{train_loss * 1e2:.3f}×10⁻²",
-            val=f"{val_loss_value * 1e2:.3f}×10⁻²",
-            best_val=f"{best_val_loss * 1e2:.3f}×10⁻² at epoch {best_epoch}",
+            {
+                f"train_{loss_label}": f"{train_loss * 1e2:.3f}×10⁻²",
+                "val_metric": f"{val_metric:.3f}",
+                f"best_val_{loss_label}": f"{best_val_metric * 1e2:.3f}×10⁻² at epoch {best_epoch}",
+            }
         )
 
         if epochs_since_improve >= patience:
@@ -178,11 +329,17 @@ def experiment(config: Config, config_path: str | None = None) -> None:
 
     training_elapsed = time.perf_counter() - training_start
 
-    # Evaluate best model on test set
+    # Evaluate best model on test set with KS test
     best_model: Model = eqx.tree_deserialise_leaves(temp_best_path, model)
     inference_start = time.perf_counter()
-    test_loss_value = eval_epoch(
-        best_model, ts_test, target_test, control_values_test, loss_fn
+    test_loss_value, test_loader_state = eval_epoch(
+        best_model,
+        test_loader,
+        test_iterate,
+        test_loader_state,
+        test_key,
+        0,
+        compute_predictions=True,
     )
     inference_elapsed = time.perf_counter() - inference_start
 
@@ -223,9 +380,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             "training_s": training_elapsed,
             "inference_s": inference_elapsed,
         },
-        "losses": {
+        str(config.experiment_config.loss.value): {
             "test": test_loss_value,
-            "min_val": best_val_loss,
+            "min_val": best_val_metric,
             "min_train": min_train_loss,
         },
     }

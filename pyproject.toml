@@ -11,15 +11,24 @@ dependencies = [
     "optax>=0.2.6",
     "stochastax",
     "polysigkernel",
+    "cyreal",
     "numpy>=2.0.0",
+    "scipy>=1.16.0",
     "pydantic>=2.12.3",
     "tqdm>=4.67.1",
     "mypy>=1.18.2",
+    "filelock>=3.20.2",
+    "matplotlib>=3.10.8",
 ]
 
 [tool.uv.sources]
 stochastax = { git = "https://github.com/luke-a-thompson/Stochastax.git", branch = "master" }
-polysigkernel = { git = "https://github.com/FrancescoPiatti/polysigkernel.git", branch = "master" }
+# polysigkernel = { git = "https://github.com/luke-a-thompson/polysigkernel.git", rev = "ee0d7df0a622e7fccb8b400faa4c1a7cdc5df41e" }  # overly complex
+# polysigkernel = { git = "https://github.com/luke-a-thompson/polysigkernel.git", rev = "474ee42b914ab944ab4312d8496c50aea63e7297" }  # Good, checkpointed solve
+polysigkernel = { git = "https://github.com/luke-a-thompson/polysigkernel.git", rev = "33dae9cd58c3d5852fa76da7603b2b1ce5c8db5e" }  # New diag
+
+
+cyreal = { git = "https://github.com/luke-a-thompson/cyreal_dynamics.git", branch = "master" }
 
 [project.scripts]
 train = "taming_the_ito_lyon.training.train_cli:main"

@@ -14,6 +14,13 @@ seed = 1
 batch_size = 96
 epochs = 200
 
+# Training mode
+training_mode = "conditional"
+# To run unconditional generation, switch training_mode and set:
+# unconditional_driver_kind = "bm"   # "bm" | "fbm" | "rl"
+# unconditional_driver_dim = 1       # number of non-time channels
+# unconditional_hurst = 0.1          # used for "fbm"/"rl"
+
 [log_ncde_config]
 
 # Log-NCDE model parameters

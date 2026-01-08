@@ -283,30 +283,31 @@ class MNDRE(eqx.Module):
 
     def __call__(
         self,
-        ts: jax.Array,
-        x: jax.Array,
+        control_values: jax.Array,
     ) -> jax.Array:
         """
         Forward pass.
 
         Standard mode (self.extrapolation_scheme=None):
-            model(ts, coeffs) -> outputs
+            model(control_values) -> outputs
 
         Extrapolation mode (self.extrapolation_scheme is set):
-            model(ts, x) -> outputs
+            model(control_values) -> outputs
         """
+        length = control_values.shape[0]
+        ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
         if self.extrapolation_scheme is not None:
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            control, _ = self.extrapolation_scheme.create_control(ts, control_values, self.n_recon)
             hidden = self._forward_with_control(ts, control)
             outputs = self._apply_readout(hidden)
 
             return outputs
         else:
             # Standard mode
-            hidden = self._forward_with_values(ts, x)
+            hidden = self._forward_with_values(ts, control_values)
 
             if self.evolving_out:
                 return self._apply_readout(hidden)

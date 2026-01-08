@@ -1,11 +1,11 @@
 [experiment_config]
 model_type = "mnrde"
-dataset_name = "ou_process"
+dataset_name = "rough_bergomi"
 
 # Extrapolation settings
-use_extrapolation = false
-extrapolation_scheme = "sg"
-n_recon = 12
+# extrapolation_scheme = "sg"
+# n_recon = 12
+# n_future = 3
 
 # Optimizer
 optimizer = "adam"
@@ -18,6 +18,13 @@ loss = "mse"
 seed = 1
 batch_size = 64
 epochs = 200
+
+# Training mode
+training_mode = "conditional"
+# To run unconditional generation, switch training_mode and set:
+# unconditional_driver_kind = "bm"   # "bm" | "fbm" | "rl"
+# unconditional_driver_dim = 1       # number of non-time channels
+# unconditional_hurst = 0.1          # used for "fbm"/"rl"
 
 [mnrde_config]
 

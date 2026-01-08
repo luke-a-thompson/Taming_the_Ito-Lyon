@@ -196,17 +196,20 @@ class LogNCDE(eqx.Module):
 
     def __call__(
         self,
-        ts: jax.Array,
-        x: jax.Array,
+        control_values: jax.Array,
     ) -> jax.Array:
+        length = control_values.shape[0]
+        ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
         if self.extrapolation_scheme is not None:
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            control, _ = self.extrapolation_scheme.create_control(
+                ts, control_values, self.n_recon
+            )
             hidden_over_time = self._forward_with_control(ts, control)
         else:
-            hidden_over_time = self._forward_with_values(ts, x)
+            hidden_over_time = self._forward_with_values(ts, control_values)
 
         if self.evolving_out:
 

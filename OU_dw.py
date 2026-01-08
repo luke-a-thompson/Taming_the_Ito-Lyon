@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import math
-from typing import Tuple
 
 import torch
 import torch.nn as nn

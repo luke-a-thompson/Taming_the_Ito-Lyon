@@ -113,17 +113,18 @@ class GRU(eqx.Module):
 
     def __call__(
         self,
-        ts: jax.Array,
-        x: jax.Array,
+        control_values: jax.Array,
     ) -> jax.Array:
+        length = control_values.shape[0]
+        ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
         if self.extrapolation_scheme is not None:
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            control, _ = self.extrapolation_scheme.create_control(ts, control_values, self.n_recon)
             x_eval = self._evaluate_control(ts, control)
         else:
-            x_eval = x
+            x_eval = control_values
         hidden = self._forward_from_x(x_eval)
 
         if self.evolving_out:

@@ -1,6 +1,5 @@
 from taming_the_ito_lyon.data.datasets import (
     add_time_channel,
-    load_npz_dataset,
     prepare_dataset,
     split_train_val_test,
     make_dataloader,
@@ -8,7 +7,6 @@ from taming_the_ito_lyon.data.datasets import (
 
 __all__ = [
     "add_time_channel",
-    "load_npz_dataset",
     "prepare_dataset",
     "split_train_val_test",
     "make_dataloader",

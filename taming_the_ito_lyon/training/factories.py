@@ -8,20 +8,27 @@ from taming_the_ito_lyon.config import (
     NRDEConfig,
     MNRDEConfig,
 )
+from taming_the_ito_lyon.config.config_options import (
+    LossType,
+    UnconditionalDriverKind,
+)
 from taming_the_ito_lyon.models import (
     NeuralCDE,
     LogNCDE,
     NeuralRDE,
     MNDRE,
     create_scheme,
+    Model,
 )
 from taming_the_ito_lyon.models.extrapolation import (
     ExtrapolationScheme as ExtrapolationSchemeProtocol,
 )
-from taming_the_ito_lyon.config import DATASETS
+from taming_the_ito_lyon.config import Datasets
 from taming_the_ito_lyon.data.datasets import prepare_dataset
-from typing import Callable, Literal
 import equinox as eqx
+from collections.abc import Callable
+from cyreal.transforms import BatchTransform, DevicePutTransform
+from cyreal.loader import DataLoader
 
 
 def _maybe_create_extrapolation_scheme(
@@ -32,7 +39,7 @@ def _maybe_create_extrapolation_scheme(
 ) -> tuple[jax.Array, ExtrapolationSchemeProtocol | None]:
     """Optionally create an extrapolation scheme and (if needed) split the PRNG key."""
 
-    if not config.experiment_config.use_extrapolation:
+    if config.experiment_config.extrapolation_scheme is None:
         return key, None
 
     # Only these models currently accept extrapolation parameters.
@@ -179,27 +186,216 @@ def create_dataset(
     Returns (ts_batched, solution, control_values).
     """
     dataset_name = config.experiment_config.dataset_name
-    if dataset_name not in DATASETS:
+    if dataset_name not in Datasets:
         raise ValueError(
-            f"Unknown dataset name '{dataset_name}'. Available: {list(DATASETS.keys())}"
+            f"Unknown dataset name '{dataset_name}'. Available: {list(Datasets.__members__.keys())}"
         )
-    npz_path = DATASETS[dataset_name]["npz_path"]
-    ts_batched, solution, control_values = prepare_dataset(npz_path)
+    ts_batched, solution, control_values = prepare_dataset(
+        dataset_name,
+        config.experiment_config.n_recon,
+        config.experiment_config.n_future,
+    )
     return ts_batched, solution, control_values
 
 
-def create_grad_fn(
-    loss_fn: Callable[[jax.Array, jax.Array], jax.Array],
-    mode: Literal["conditional", "unconditional"],
-):
-    """
-    Create a gradient function for the given loss function and mode.
-    """
-    if mode == "conditional":
-        from taming_the_ito_lyon.training.train import batch_loss_conditional
+def create_dataloaders(
+    config: Config,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    match config.experiment_config.dataset_name:
+        case Datasets.BLACK_SCHOLES | Datasets.BERGOMI | Datasets.ROUGH_BERGOMI:
+            from taming_the_ito_lyon.data.rough_volatility import RoughVolatilityDataset
 
-        return eqx.filter_value_and_grad(batch_loss_conditional)
-    else:
-        from taming_the_ito_lyon.training.train import batch_loss_unconditional
+            train = RoughVolatilityDataset(
+                config=config,
+                split="train",
+            ).make_array_source()
+            val = RoughVolatilityDataset(
+                config=config,
+                split="val",
+            ).make_array_source()
+            test = RoughVolatilityDataset(
+                config=config,
+                split="test",
+            ).make_array_source()
+        case _:
+            raise ValueError(
+                f"Unknown dataset name: {config.experiment_config.dataset_name}"
+            )
 
-        return eqx.filter_value_and_grad(batch_loss_unconditional)
+    dataloaders: list[DataLoader] = []
+    for source in [train, val, test]:
+        pipeline = [
+            source,
+            BatchTransform(
+                batch_size=config.experiment_config.batch_size, drop_last=True
+            ),
+            DevicePutTransform(),
+        ]
+        dataloader = DataLoader(pipeline)
+        dataloader.init_state(jax.random.key(config.experiment_config.seed))
+        dataloaders.append(dataloader)
+    return dataloaders[0], dataloaders[1], dataloaders[2]  # train, val, test
+
+
+def create_unconditional_control_sampler(
+    *,
+    driver_kind: UnconditionalDriverKind,
+    driver_dim: int,
+    hurst: float,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """
+    Create an unconditional control sampler.
+
+    Returns a function `(ts, key) -> control_values` of shape (T, driver_dim + 1),
+    where the leading channel is `ts` and the remaining channels are the sampled
+    driver values on the same grid.
+    """
+    import jax.numpy as jnp
+    import jax.random as jr
+    from stochastax.controls.drivers import (
+        bm_driver,
+        fractional_bm_driver,
+        riemann_liouville_driver,
+    )
+
+    def with_time(ts: jax.Array, values: jax.Array) -> jax.Array:
+        return jnp.concatenate([ts[:, None], values], axis=-1)
+
+    def anchor_at_basepoint(values: jax.Array) -> jax.Array:
+        """Anchor the path at the origin without changing its length.
+
+        Note: "basepoint augmentation" in the signature literature often means
+        *prepending an extra point* at the start of the path. In this codebase the
+        model/targets assume a fixed length `T`, so instead we simply translate the
+        path to start at 0 (which does not affect signatures, as they depend on
+        increments).
+        """
+        return values - values[:1]
+
+    def sample(ts: jax.Array, key: jax.Array) -> jax.Array:
+        timesteps = int(ts.shape[0]) - 1
+        if timesteps <= 0:
+            raise ValueError(f"ts must have length >= 2, got {ts.shape[0]}")
+
+        if driver_kind == UnconditionalDriverKind.BM:
+            values = bm_driver(key, timesteps=timesteps, dim=driver_dim).path
+            values = anchor_at_basepoint(values)
+            return with_time(ts, values)
+
+        if driver_kind == UnconditionalDriverKind.FBM:
+            values = fractional_bm_driver(
+                key, timesteps=timesteps, dim=driver_dim, hurst=float(hurst)
+            ).path
+            values = anchor_at_basepoint(values)
+            return with_time(ts, values)
+
+        if driver_kind == UnconditionalDriverKind.RL:
+            bm_key, rl_key = jr.split(key, 2)
+            bm_path = bm_driver(bm_key, timesteps=timesteps, dim=driver_dim)
+            values = riemann_liouville_driver(
+                rl_key, timesteps=timesteps, hurst=float(hurst), bm_path=bm_path
+            ).path
+            values = anchor_at_basepoint(values)
+            return with_time(ts, values)
+
+        raise ValueError(f"Unknown driver_kind: {driver_kind}")
+
+    return sample
+
+
+def create_unconditional_control_sampler_batched(
+    *,
+    driver_kind: UnconditionalDriverKind,
+    driver_dim: int,
+    hurst: float,
+) -> Callable[[jax.Array, jax.Array, int], jax.Array]:
+    """
+    Create a batched unconditional control sampler.
+
+    Returns a function `(ts, key, batch_size) -> control_values_batch` of shape
+    (batch_size, T, driver_dim + 1), where the leading channel is `ts` and the
+    remaining channels are the sampled driver values on the same grid.
+    """
+    import jax.random as jr
+
+    single_sampler = create_unconditional_control_sampler(
+        driver_kind=driver_kind, driver_dim=driver_dim, hurst=hurst
+    )
+
+    def sample_batch(ts: jax.Array, key: jax.Array, batch_size: int) -> jax.Array:
+        keys = jr.split(key, batch_size)
+        return jax.vmap(lambda k: single_sampler(ts, k))(keys)
+
+    return sample_batch
+
+
+def create_grad_batch_loss_fns(
+    *,
+    loss_type: LossType,
+    output_path_dim: int | None = None,
+) -> tuple[
+    Callable[[Model, jax.Array, jax.Array], tuple[jax.Array, optax.Updates]],
+    Callable[[Model, jax.Array, jax.Array], jax.Array],
+]:
+    """
+    Create (grad_fn, batch_loss_fn) for training and evaluation.
+
+    Both returned functions share the same call signature:
+        (model, control_values_b, target_b)
+
+    where `control_values_b` is a batch of control paths that will be fed to the model.
+    """
+    from taming_the_ito_lyon.training.grad_functions import batch_loss
+    from taming_the_ito_lyon.training.losses import (
+        mse_loss,
+        rotational_geodesic_loss,
+        truncated_sig_loss_time_augmented,
+    )
+
+    match loss_type:
+        case LossType.MSE:
+            loss_fn = mse_loss
+        case LossType.RGE:
+            loss_fn = rotational_geodesic_loss
+        case LossType.SIGKER:
+            if output_path_dim is None:
+                raise ValueError(
+                    "output_path_dim must be provided when loss_type is SIGKER so the "
+                    "Hopf algebra can be constructed outside of jit."
+                )
+            # Time augmentation is important, especially for 1D outputs.
+            #
+            # IMPORTANT: signatures/log-signatures depend on increments (dx), so they
+            # are translation-invariant in the value channels. If the absolute level
+            # matters (e.g. matching initial level "h0"/v0), then we must explicitly
+            # encode it. We do that via a zero-basepoint prepend, which makes x0 an
+            # increment and therefore visible to signature features.
+            loss_fn = truncated_sig_loss_time_augmented(
+                value_dim=int(output_path_dim),
+                anchor_at_start=False,
+                prepend_zero_basepoint=True,
+            )
+        case _:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+    def batch_loss_fn(
+        model: Model, control_values_b: jax.Array, target_b: jax.Array
+    ) -> jax.Array:
+        return batch_loss(model, control_values_b, target_b, loss_fn)
+
+    return eqx.filter_value_and_grad(batch_loss_fn), batch_loss_fn
+
+
+def configure_jax() -> None:
+    """Configure global JAX settings (matmul precision and persistent compilation cache)."""
+    import os
+
+    jax.config.update("jax_default_matmul_precision", "high")
+    jax.config.update("jax_enable_compilation_cache", True)
+    jax.config.update(
+        "jax_compilation_cache_max_size",
+        2048 * 1024 * 1024,  # 2GB
+    )
+    cache_dir = os.path.abspath("jax_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache_dir)

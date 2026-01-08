@@ -6,10 +6,11 @@ https://docs.kidger.site/diffrax/examples/neural_cde/
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import jax.nn as jnn
 import jax.random as jr
 import diffrax
-from collections.abc import Callable
+from typing import Callable
 
 from .extrapolation import ExtrapolationScheme
 
@@ -71,7 +72,7 @@ class NeuralCDE(eqx.Module):
 
     # Static configuration
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
-    evolving_out: bool
+    evolving_out: bool = eqx.field(static=True)
 
     # Extrapolation scheme
     extrapolation_scheme: ExtrapolationScheme | None = eqx.field(static=True)
@@ -92,7 +93,7 @@ class NeuralCDE(eqx.Module):
         vf_mlp_depth: int,
         *,
         key: jax.Array,
-        readout_activation: Callable[[jax.Array], jax.Array] = jnn.tanh,
+        readout_activation: Callable[[jax.Array], jax.Array] | None = None,
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
         stepsize_controller: diffrax.AbstractStepSizeController | None = None,
         rtol: float = 1e-2,
@@ -107,8 +108,10 @@ class NeuralCDE(eqx.Module):
         # Modules
         self.initial_cond_mlp = eqx.nn.MLP(
             in_size=input_path_dim,
-            out_size=init_hidden_dim,
-            width_size=vf_hidden_dim,
+            # The CDE/ODE state dimension must match the vector-field input dimension.
+            # `init_hidden_dim` controls the *width* of this MLP, not the output size.
+            out_size=cde_state_dim,
+            width_size=init_hidden_dim,
             depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,
@@ -126,7 +129,9 @@ class NeuralCDE(eqx.Module):
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = readout_activation
+        self.readout_activation = (
+            readout_activation if readout_activation is not None else (lambda x: x)
+        )
 
         # Static configuration
         self.extrapolation_scheme = extrapolation_scheme
@@ -181,32 +186,35 @@ class NeuralCDE(eqx.Module):
 
     def __call__(
         self,
-        ts: jax.Array,
-        x: jax.Array,
+        control_values: jax.Array,
     ) -> jax.Array:
         """
         Forward pass.
 
         Standard mode (self.extrapolation_scheme is None):
-            model(ts, coeffs) -> outputs
+            model(control_values) -> outputs
 
         Extrapolation mode (self.extrapolation_scheme is set):
-            model(ts, x) -> outputs
-            where x has shape (T_total, C) and only the first n_recon points are used
+            model(control_values) -> outputs
+            where control_values has shape (T_total, C) and only the first n_recon points are used
             to fit the control; the remainder is extrapolated.
         """
+        length = control_values.shape[0]
+        ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
         if self.extrapolation_scheme is not None:
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, x, self.n_recon)
+            control, _ = self.extrapolation_scheme.create_control(
+                ts, control_values, self.n_recon
+            )
             hidden = self._forward_with_control(ts, control)
             outputs = self._apply_readout(hidden)
 
             return outputs
         else:
             # Standard mode: build interpolation from raw values.
-            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=x)
+            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=control_values)
             control = diffrax.CubicInterpolation(ts, coeffs)
             hidden = self._forward_with_control(ts, control)
 

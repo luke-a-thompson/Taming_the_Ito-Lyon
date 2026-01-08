@@ -4,8 +4,8 @@ A reimplementation of Neural Rough Differential Equations (NRDE) using Jax and S
 
 import equinox as eqx
 import jax
-import jax.nn as jnn
 import jax.numpy as jnp
+import jax.nn as jnn
 import jax.random as jr
 from collections.abc import Callable
 import diffrax
@@ -51,7 +51,7 @@ class NRDEFunc(eqx.Module):
             width_size=vf_hidden_dim,
             depth=vf_mlp_depth,
             activation=jnn.softplus,
-            final_activation=jnn.tanh,
+            final_activation=lambda x: x,
             key=key,
         )
 
@@ -172,14 +172,13 @@ class NeuralRDE(eqx.Module):
 
     def __call__(
         self,
-        ts: jax.Array,
         control_values: jax.Array,
     ) -> jax.Array:
         """
         Forward pass.
 
         Parameters
-        - ts: shape (T,). Monotonically increasing timestamps.
+        - control_values: shape (T, C). Control values.
         - control_or_coeffs: either a diffrax control path (e.g. CubicInterpolation)
           or a tuple of cubic coefficients compatible with diffrax.CubicInterpolation.
 
@@ -187,6 +186,8 @@ class NeuralRDE(eqx.Module):
         - If self.evolving_out is False: shape (out_size,)
         - If self.evolving_out is True: shape (T, out_size)
         """
+        length = control_values.shape[0]
+        ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
         hidden_over_time = self._forward_with_values(ts, control_values)
 
         if self.evolving_out:

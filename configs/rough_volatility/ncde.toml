@@ -1,31 +1,31 @@
 [experiment_config]
 model_type = "ncde"
-dataset_name = "ou_process"
+dataset_name = "rough_bergomi"
 
 # Optimizer
-optimizer = "adam"
-learning_rate = 0.001
+optimizer = "adamw"
+learning_rate = 1e-4
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
-loss = "mse"
+loss = "sigker"
 seed = 1
 batch_size = 128
 epochs = 200
 
 # Training mode
-training_mode = "conditional"
+training_mode = "unconditional"
 # To run unconditional generation, switch training_mode and set:
-# unconditional_driver_kind = "bm"   # "bm" | "fbm" | "rl"
-# unconditional_driver_dim = 1       # number of non-time channels
-# unconditional_hurst = 0.1          # used for "fbm"/"rl"
+unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
+unconditional_driver_dim = 1     # number of non-time channels
+unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
 
 [ncde_config]
 
 # NCDE model parameters
-cde_state_dim = 64
-init_hidden_dim = 64
+cde_state_dim = 16
+init_hidden_dim = 32
 vf_hidden_dim = 64
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
