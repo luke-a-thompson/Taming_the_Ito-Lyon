@@ -13,9 +13,10 @@ import time
 from collections.abc import Callable
 
 import optax
-from cyreal.loader import DataLoader
+from cyreal.loader import DataLoader, _LoaderState
 from taming_the_ito_lyon.training.results_gathering_fns import (
     get_rough_volatility_results,
+    ResultsDict,
 )
 from taming_the_ito_lyon.training.factories import (
     create_model,
@@ -160,7 +161,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     signal.signal(signal.SIGINT, sigint_handler)
     atexit.register(cleanup_temp)
 
-    best_val_metric = float("inf")
+    min_val_metric = float("inf")
     min_train_loss = float("inf")
     best_epoch = -1
     epochs_since_improve = 0
@@ -226,12 +227,13 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     def eval_epoch(
         model: Model,
         loader: DataLoader,
-        iterate: Callable[[object], tuple[dict[str, jax.Array], object, jax.Array]],
-        loader_state: object,
+        iterate: Callable[
+            [_LoaderState], tuple[dict[str, jax.Array], _LoaderState, jax.Array]
+        ],
+        loader_state: _LoaderState,
         epoch_key: jax.Array | None,
         epoch_idx: int,
-        compute_predictions: bool = False,
-    ) -> tuple[float, object | None]:
+    ) -> tuple[float, ResultsDict, _LoaderState]:
         total_loss = 0.0
         preds_batches: list[jax.Array] = []
         targets_batches: list[jax.Array] = []
@@ -260,25 +262,20 @@ def experiment(config: Config, config_path: str | None = None) -> None:
 
             total_loss += float(eval_step(control_values_b, batch["solution"], model))
 
-            if compute_predictions:
-                preds_batches.append(predict_batch(control_values_b, model))
-                targets_batches.append(batch["solution"])
+            preds_batches.append(predict_batch(control_values_b, model))
+            targets_batches.append(batch["solution"])
 
         avg_loss = total_loss / max(1, int(loader.steps_per_epoch))
 
         # Compute KS test if predictions were collected
-        if compute_predictions and preds_batches:
-            ks_result = get_rough_volatility_results(
-                preds_batches,
-                targets_batches,
-                epoch_idx,
-                ks_time_steps=[-1],
-                n_plot=batch_size,
-            )
-            eval_metric = ks_result if ks_result is not None else avg_loss
-        else:
-            eval_metric = avg_loss
-        return eval_metric, loader_state
+        results_dict = get_rough_volatility_results(
+            preds_batches,
+            targets_batches,
+            epoch_idx,
+            ks_time_steps=[-1],
+            n_plot=batch_size,
+        )
+        return avg_loss, results_dict, loader_state
 
     epoch_bar = tqdm(
         range(epochs),
@@ -292,32 +289,28 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             model, opt_state, mode, train_key, epoch_idx
         )
         min_train_loss = min(min_train_loss, train_loss)
-        val_metric, val_loader_state = eval_epoch(
+        val_loss, val_results_dict, val_loader_state = eval_epoch(
             model,
             val_loader,
             val_iterate,
             val_loader_state,
             val_key,
             epoch_idx,
-            compute_predictions=True,
         )
 
-        if val_metric < best_val_metric:
-            best_val_metric = val_metric
+        if val_results_dict.eval_metric < min_val_metric:
+            min_val_metric = val_results_dict.eval_metric
             best_epoch = epoch_idx
             eqx.tree_serialise_leaves(temp_best_path, model)
             epochs_since_improve = 0
-            tqdm.write(
-                f"New best val metric: {val_metric:.3f} at epoch {epoch_idx}. Saving model."
-            )
         else:
             epochs_since_improve += 1
 
         epoch_bar.set_postfix(
             {
                 f"train_{loss_label}": f"{train_loss * 1e2:.3f}×10⁻²",
-                "val_metric": f"{val_metric:.3f}",
-                f"best_val_{loss_label}": f"{best_val_metric * 1e2:.3f}×10⁻² at epoch {best_epoch}",
+                f"best_val_{loss_label}": f"{min_val_metric * 1e2:.3f}×10⁻² at epoch {best_epoch}",
+                "val_metric": f"{val_results_dict.eval_metric:.3f}",
             }
         )
 
@@ -332,14 +325,13 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     # Evaluate best model on test set with KS test
     best_model: Model = eqx.tree_deserialise_leaves(temp_best_path, model)
     inference_start = time.perf_counter()
-    test_loss_value, test_loader_state = eval_epoch(
+    test_loss, test_results_dict, test_loader_state = eval_epoch(
         best_model,
         test_loader,
         test_iterate,
         test_loader_state,
         test_key,
         0,
-        compute_predictions=True,
     )
     inference_elapsed = time.perf_counter() - inference_start
 
@@ -381,10 +373,11 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             "inference_s": inference_elapsed,
         },
         str(config.experiment_config.loss.value): {
-            "test": test_loss_value,
-            "min_val": best_val_metric,
+            "test": test_results_dict.eval_metric,
+            "min_val": min_val_metric,
             "min_train": min_train_loss,
         },
+        "test_results_dict": test_results_dict,
     }
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
@@ -393,6 +386,6 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         f"\nResults: {num_params:,} params | "
         f"train {training_elapsed:.1f}s | "
         f"inference {inference_elapsed * 1000:.1f}ms | "
-        f"test loss {test_loss_value:.4f}"
+        f"test metric {test_results_dict.eval_metric:.4f}"
     )
     tqdm.write(f"Saved to: {run_dir}/")

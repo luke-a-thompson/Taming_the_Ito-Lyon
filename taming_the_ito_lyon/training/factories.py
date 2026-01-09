@@ -24,7 +24,6 @@ from taming_the_ito_lyon.models.extrapolation import (
     ExtrapolationScheme as ExtrapolationSchemeProtocol,
 )
 from taming_the_ito_lyon.config import Datasets
-from taming_the_ito_lyon.data.datasets import prepare_dataset
 import equinox as eqx
 from collections.abc import Callable
 from cyreal.transforms import BatchTransform, DevicePutTransform
@@ -118,6 +117,7 @@ def create_model(
             return MNDRE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
+                initial_hidden_dim=config.nn_config.initial_hidden_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
                 vf_mlp_depth=config.nn_config.vf_mlp_depth,
@@ -177,27 +177,6 @@ def create_optimizer(
     return base_optim
 
 
-def create_dataset(
-    config: Config,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Create dataset arrays from configuration.
-
-    Returns (ts_batched, solution, control_values).
-    """
-    dataset_name = config.experiment_config.dataset_name
-    if dataset_name not in Datasets:
-        raise ValueError(
-            f"Unknown dataset name '{dataset_name}'. Available: {list(Datasets.__members__.keys())}"
-        )
-    ts_batched, solution, control_values = prepare_dataset(
-        dataset_name,
-        config.experiment_config.n_recon,
-        config.experiment_config.n_future,
-    )
-    return ts_batched, solution, control_values
-
-
 def create_dataloaders(
     config: Config,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
@@ -217,6 +196,21 @@ def create_dataloaders(
                 config=config,
                 split="test",
             ).make_array_source()
+        case Datasets.SG_SO3_SIMULATION:
+            from taming_the_ito_lyon.data.so3_dynamics_sim import SO3DynamicsSim
+
+            train = SO3DynamicsSim(
+                config=config,
+                split="train",
+            ).make_disk_source()
+            val = SO3DynamicsSim(
+                config=config,
+                split="val",
+            ).make_disk_source()
+            test = SO3DynamicsSim(
+                config=config,
+                split="test",
+            ).make_disk_source()
         case _:
             raise ValueError(
                 f"Unknown dataset name: {config.experiment_config.dataset_name}"
@@ -345,7 +339,6 @@ def create_grad_batch_loss_fns(
 
     where `control_values_b` is a batch of control paths that will be fed to the model.
     """
-    from taming_the_ito_lyon.training.grad_functions import batch_loss
     from taming_the_ito_lyon.training.losses import (
         mse_loss,
         rotational_geodesic_loss,
@@ -379,9 +372,13 @@ def create_grad_batch_loss_fns(
             raise ValueError(f"Unknown loss type: {loss_type}")
 
     def batch_loss_fn(
-        model: Model, control_values_b: jax.Array, target_b: jax.Array
+        model: Model,
+        control_values_b: jax.Array,
+        target_b: jax.Array,
     ) -> jax.Array:
-        return batch_loss(model, control_values_b, target_b, loss_fn)
+        preds = jax.vmap(model)(control_values_b)
+        loss = loss_fn(preds, target_b)
+        return loss
 
     return eqx.filter_value_and_grad(batch_loss_fn), batch_loss_fn
 

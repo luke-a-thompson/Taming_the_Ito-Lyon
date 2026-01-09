@@ -285,14 +285,17 @@ class MNRDEConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Model params
-    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
-    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
+    initial_hidden_dim: PositiveInt = Field(
+        description="Initial condition MLP hidden state dimension"
+    )
     initial_cond_mlp_depth: PositiveInt = Field(
         description="Initial condition MLP depth (number of hidden layers)"
     )
+    vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
     vf_mlp_depth: PositiveInt = Field(
         description="Vector field MLP depth (number of hidden layers)"
     )
+    cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
     # Signature config

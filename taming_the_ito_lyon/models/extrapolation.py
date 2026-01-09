@@ -57,6 +57,10 @@ class LinearScheme(eqx.Module):
         x_all: jax.Array,
         n_recon: int,
     ) -> tuple[diffrax.LinearInterpolation, jax.Array]:
+        if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
+            raise ValueError(
+                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+            )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
         # Fit only on reconstruction data - diffrax will extrapolate linearly
@@ -77,6 +81,10 @@ class CubicScheme(eqx.Module):
         x_all: jax.Array,
         n_recon: int,
     ) -> tuple[diffrax.CubicInterpolation, jax.Array]:
+        if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
+            raise ValueError(
+                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+            )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
         # Fit only on reconstruction data - diffrax will extrapolate
@@ -113,6 +121,10 @@ class WeightedSGScheme(eqx.Module):
         n_recon: int,
     ) -> tuple[_PolynomialPath, jax.Array]:
         """Create polynomial path that extrapolates smoothly to future."""
+        if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
+            raise ValueError(
+                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+            )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
         seq_len = n_recon
@@ -250,6 +262,10 @@ class MLPScheme(eqx.Module):
         x_all: jax.Array,
         n_recon: int,
     ) -> tuple[_MLPPath, jax.Array]:
+        if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
+            raise ValueError(
+                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+            )
         x_recon = x_all[:n_recon]
 
         # Encode reconstruction data into context (mean pooling)

@@ -3,6 +3,14 @@ import jax
 import numpy as np
 from scipy.stats import ks_2samp
 import os
+from dataclasses import dataclass
+
+
+@dataclass
+class ResultsDict:
+    eval_metric: float
+    ks_test_p_times: list[float]
+    ks_test_statistics: list[float]
 
 
 def get_rough_volatility_results(
@@ -11,7 +19,7 @@ def get_rough_volatility_results(
     epoch_idx: int,
     ks_time_steps: list[int] = [0, 21, 43, 64],
     n_plot: int | None = None,
-) -> float:
+) -> ResultsDict:
     preds_batches = preds if isinstance(preds, list) else [preds]
     targets_batches = targets if isinstance(targets, list) else [targets]
 
@@ -51,4 +59,10 @@ def get_rough_volatility_results(
         ks_res, p_val = ks_2samp(pred_samples, target_samples)  # type: ignore
         ks_stats.append(float(ks_res))  # type: ignore
 
-    return float(np.median(ks_stats))
+    results_dict = ResultsDict(
+        eval_metric=float(np.median(ks_stats)),
+        ks_test_p_times=[float(t) for t in ks_time_steps],
+        ks_test_statistics=[float(s) for s in ks_stats],
+    )
+
+    return results_dict
