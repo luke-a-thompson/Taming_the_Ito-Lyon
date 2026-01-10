@@ -6,7 +6,7 @@ from .gru import GRU
 from .extrapolation import (
     ExtrapolationScheme,
     LinearScheme,
-    CubicScheme,
+    HermiteScheme,
     WeightedSGScheme,
     MLPScheme,
     create_scheme,
@@ -23,7 +23,7 @@ __all__ = [
     "GRU",
     "ExtrapolationScheme",
     "LinearScheme",
-    "CubicScheme",
+    "HermiteScheme",
     "WeightedSGScheme",
     "MLPScheme",
     "create_scheme",

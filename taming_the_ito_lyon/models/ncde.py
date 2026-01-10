@@ -12,6 +12,7 @@ import jax.random as jr
 import diffrax
 from typing import Callable
 
+from stochastax.manifolds import SO3
 from .extrapolation import ExtrapolationScheme
 
 
@@ -105,9 +106,12 @@ class NeuralCDE(eqx.Module):
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
 
+        # Control dimension includes time channel: control_dim = input_path_dim + 1
+        control_path_dim = input_path_dim + 1
+
         # Modules
         self.initial_cond_mlp = eqx.nn.MLP(
-            in_size=input_path_dim,
+            in_size=control_path_dim,
             # The CDE/ODE state dimension must match the vector-field input dimension.
             # `init_hidden_dim` controls the *width* of this MLP, not the output size.
             out_size=cde_state_dim,
@@ -117,7 +121,7 @@ class NeuralCDE(eqx.Module):
             key=k1,
         )
         self.cde_func = CDEFunc(
-            input_path_dim=input_path_dim,
+            input_path_dim=control_path_dim,
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
             vf_mlp_depth=vf_mlp_depth,
@@ -147,11 +151,12 @@ class NeuralCDE(eqx.Module):
         )
 
     def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
-        """Apply readout to hidden states."""
+        """Apply readout to hidden states, converting from 6D to 3x3 rotation matrices."""
 
         def apply_single(y: jax.Array) -> jax.Array:
             activation = self.readout_activation(self.readout_layer(y))
-            return activation
+            rotmat = SO3.from_6d(activation)
+            return rotmat
 
         return jax.vmap(apply_single)(hidden_states)
 
@@ -221,4 +226,6 @@ class NeuralCDE(eqx.Module):
             if self.evolving_out:
                 return self._apply_readout(hidden)
 
-            return self.readout_activation(self.readout_layer(hidden[-1]))
+            # Single output case: also convert from 6D to 3x3
+            final_output = self.readout_activation(self.readout_layer(hidden[-1]))
+            return SO3.from_6d(final_output)

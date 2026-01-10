@@ -15,7 +15,6 @@ from collections.abc import Callable
 import optax
 from cyreal.loader import DataLoader, _LoaderState
 from taming_the_ito_lyon.training.results_gathering_fns import (
-    get_rough_volatility_results,
     ResultsDict,
 )
 from taming_the_ito_lyon.training.factories import (
@@ -25,12 +24,14 @@ from taming_the_ito_lyon.training.factories import (
     create_unconditional_control_sampler_batched,
     create_grad_batch_loss_fns,
     configure_jax,
+    create_results_gathering_fn,
 )
 from taming_the_ito_lyon.config import (
     Config,
 )
 from taming_the_ito_lyon.config.config_options import TrainingMode
 from taming_the_ito_lyon.models import Model
+from taming_the_ito_lyon.config.config_options import Datasets, LossType
 
 SAVED_MODELS_DIR = "saved_models"
 
@@ -63,7 +64,8 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     shape_batch, _, _ = test_iterate(test_loader_state)
 
     batch_size, timesteps, input_channels = shape_batch["driver"].shape
-    target_channels = shape_batch["solution"].shape[-1]
+    # `solution` may be either (B, T, C) or (B, T, 3, 3) depending on dataset.
+    # Do not infer model output head size from this blindly.
     ts_full = jnp.linspace(0.0, 1.0, timesteps, dtype=shape_batch["solution"].dtype)
 
     if mode == TrainingMode.UNCONDITIONAL:
@@ -74,10 +76,15 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     else:
         input_path_dim = input_channels
 
-    model = create_model(
+    # For SO(3) simulation with rotational-geodesic loss we train a 6D head and
+    # Gram–Schmidt it into a (3,3) rotation matrix via SO3.from_6d.
+    is_so3_rge = config.experiment_config.dataset_name == Datasets.SG_SO3_SIMULATION
+    output_head_dim = 6 if is_so3_rge else int(shape_batch["solution"].shape[-1])
+
+    model: Model = create_model(
         config=config,
         input_path_dim=input_path_dim,
-        output_path_dim=target_channels,
+        output_path_dim=output_head_dim,
         key=model_key,
     )
 
@@ -108,7 +115,8 @@ def experiment(config: Config, config_path: str | None = None) -> None:
 
     grad_fn, batch_loss_fn = create_grad_batch_loss_fns(
         loss_type=config.experiment_config.loss,
-        output_path_dim=int(target_channels),
+        # Only used for SIGKER; for SO3+RGE we keep targets as (3,3) matrices.
+        output_path_dim=int(output_head_dim),
     )
 
     @eqx.filter_jit(donate="all")
@@ -179,7 +187,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         epoch_idx: int,
     ) -> tuple[float, Model, optax.OptState]:
         nonlocal train_loader_state
-        total_loss = 0.0
+        # Keep accumulation on-device to avoid forcing a device sync every step.
+        total_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        tqdm_every = int(config.experiment_config.tqdm_update_interval)
         pbar = tqdm(
             range(train_loader.steps_per_epoch),
             desc="Training batches",
@@ -187,7 +197,6 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             leave=False,
         )
         for step_idx in pbar:
-            data_time = time.perf_counter()
             batch, train_loader_state, _ = train_iterate(train_loader_state)
 
             # Get control values based on mode
@@ -203,26 +212,25 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             else:
                 control_values_b = batch["driver"]
 
-            data_time_elapsed = time.perf_counter() - data_time
-            train_time = time.perf_counter()
             loss_value, model, opt_state = train_step(
                 control_values_b,
                 batch["solution"],
                 model,
                 opt_state,
             )
-            total_loss += float(loss_value)
-            train_time_elapsed = time.perf_counter() - train_time
-            pbar.set_postfix(
-                {
-                    f"train_{loss_label}": f"{float(loss_value) * 1e2:.3f}×10⁻²",
-                    "data_time": f"{data_time_elapsed:.2f}s",
-                    "train_time": f"{train_time_elapsed:.2f}s",
-                }
-            )
+            total_loss = total_loss + loss_value
 
-        avg_loss = total_loss / max(1, int(train_loader.steps_per_epoch))
+            # Only sync to host occasionally; converting device arrays to Python
+            # scalars every step can dominate wall time.
+            if tqdm_every > 0 and (step_idx % tqdm_every == 0):
+                loss_host = float(jax.device_get(loss_value))
+                pbar.set_postfix({f"train_{loss_label}": f"{loss_host * 1e2:.3f}×10⁻²"})
+
+        steps = max(1, int(train_loader.steps_per_epoch))
+        avg_loss = float(jax.device_get(total_loss)) / float(steps)
         return avg_loss, model, opt_state
+
+    results_gathering_fn = create_results_gathering_fn(config)
 
     def eval_epoch(
         model: Model,
@@ -234,7 +242,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         epoch_key: jax.Array | None,
         epoch_idx: int,
     ) -> tuple[float, ResultsDict, _LoaderState]:
-        total_loss = 0.0
+        # Keep accumulation on-device to avoid syncing every step.
+        total_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        tqdm_every = int(config.experiment_config.tqdm_update_interval)
         preds_batches: list[jax.Array] = []
         targets_batches: list[jax.Array] = []
 
@@ -260,19 +270,25 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             else:
                 control_values_b = batch["driver"]
 
-            total_loss += float(eval_step(control_values_b, batch["solution"], model))
+            loss_value = eval_step(control_values_b, batch["solution"], model)
+            total_loss = total_loss + loss_value
+
+            if tqdm_every > 0 and (step_idx % tqdm_every == 0):
+                loss_host = float(jax.device_get(loss_value))
+                pbar.set_postfix({f"val_{loss_label}": f"{loss_host * 1e2:.3f}×10⁻²"})
 
             preds_batches.append(predict_batch(control_values_b, model))
             targets_batches.append(batch["solution"])
 
-        avg_loss = total_loss / max(1, int(loader.steps_per_epoch))
+        steps = max(1, int(loader.steps_per_epoch))
+        avg_loss = float(jax.device_get(total_loss)) / float(steps)
 
         # Compute KS test if predictions were collected
-        results_dict = get_rough_volatility_results(
+        results_dict = results_gathering_fn(
             preds_batches,
             targets_batches,
             epoch_idx,
-            ks_time_steps=[-1],
+            times_to_save=[-1],
             n_plot=batch_size,
         )
         return avg_loss, results_dict, loader_state
@@ -298,8 +314,14 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             epoch_idx,
         )
 
-        if val_results_dict.eval_metric < min_val_metric:
-            min_val_metric = val_results_dict.eval_metric
+        eval_metric = (
+            val_results_dict.eval_metric
+            if val_results_dict.eval_metric is not None
+            else val_loss
+        )
+
+        if eval_metric < min_val_metric:
+            min_val_metric = eval_metric
             best_epoch = epoch_idx
             eqx.tree_serialise_leaves(temp_best_path, model)
             epochs_since_improve = 0
@@ -310,7 +332,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             {
                 f"train_{loss_label}": f"{train_loss * 1e2:.3f}×10⁻²",
                 f"best_val_{loss_label}": f"{min_val_metric * 1e2:.3f}×10⁻² at epoch {best_epoch}",
-                "val_metric": f"{val_results_dict.eval_metric:.3f}",
+                "val_metric": f"{eval_metric:.3f}",
             }
         )
 
@@ -334,6 +356,12 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         0,
     )
     inference_elapsed = time.perf_counter() - inference_start
+
+    test_eval_metric = (
+        test_results_dict.eval_metric
+        if test_results_dict.eval_metric is not None
+        else test_loss
+    )
 
     # Create run directory and save final artifacts
     run_dirname = _get_run_dirname(model_name)
@@ -373,7 +401,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             "inference_s": inference_elapsed,
         },
         str(config.experiment_config.loss.value): {
-            "test": test_results_dict.eval_metric,
+            "test": test_eval_metric,
             "min_val": min_val_metric,
             "min_train": min_train_loss,
         },
@@ -386,6 +414,6 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         f"\nResults: {num_params:,} params | "
         f"train {training_elapsed:.1f}s | "
         f"inference {inference_elapsed * 1000:.1f}ms | "
-        f"test metric {test_results_dict.eval_metric:.4f}"
+        f"test metric {test_eval_metric:.4f}"
     )
     tqdm.write(f"Saved to: {run_dir}/")

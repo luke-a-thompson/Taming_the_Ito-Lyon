@@ -13,6 +13,13 @@ def mse_loss(
     return jnp.mean((pred - target) ** 2)
 
 
+def frobenius_loss(
+    pred: jax.Array,
+    target: jax.Array,
+) -> jax.Array:
+    return jnp.mean(jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1)))
+
+
 def rotational_geodesic_loss(
     pred: jax.Array,
     target: jax.Array,
@@ -32,9 +39,19 @@ def rotational_geodesic_loss(
         f"pred and target must have the same shape, got {pred.shape} and {target.shape}"
     )
     assert pred.shape[-1] == pred.shape[-2], "pred and target must be square matrices"
+    # NOTE: The closed-form RGE formula assumes both inputs are valid rotation matrices.
+    # In practice, simulator outputs can drift slightly off SO(3) and floating point error
+    # can push the arcsin argument marginally outside [-1, 1], producing NaNs.
     frobenius_norm = jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1))
-    rge = 2.0 * jnp.arcsin(frobenius_norm / (2.0 * jnp.sqrt(2.0)))
-    return jnp.mean(rge)
+    denom = 2.0 * jnp.sqrt(2.0)
+    ratio = frobenius_norm / denom
+    # Also avoid the arcsin derivative singularity at 1.0, which can create `inf`
+    # gradients and quickly destabilize optimization early in training.
+    eps = jnp.asarray(1e-5, dtype=ratio.dtype)
+    ratio = jnp.clip(ratio, a_min=0.0, a_max=1.0 - eps)
+    rge_rad = 2.0 * jnp.arcsin(ratio)
+    rge_deg = rge_rad * (180.0 / jnp.pi)
+    return jnp.mean(rge_deg)
 
 
 def truncated_sig_loss(

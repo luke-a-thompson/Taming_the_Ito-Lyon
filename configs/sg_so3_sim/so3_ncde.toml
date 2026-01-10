@@ -3,9 +3,8 @@ model_type = "ncde"
 dataset_name = "sg_so3_simulation"
 
 # Extrapolation settings
-extrapolation_scheme = "sg"
+extrapolation_scheme = "hermite"
 n_recon = 12
-n_future = 3
 
 # Optimizer
 optimizer = "adamw"
@@ -14,9 +13,9 @@ weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
-loss = "rge"
+loss = "frobenius"
 seed = 1
-batch_size = 128
+batch_size = 512
 epochs = 200
 
 # Training mode
@@ -34,7 +33,7 @@ init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
-out_size = 1
+out_size = 6
 
 # Solver tolerances
 rtol = 0.001

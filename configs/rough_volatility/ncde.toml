@@ -11,7 +11,7 @@ max_grad_norm = 1.0
 # Training
 loss = "sigker"
 seed = 1
-batch_size = 128
+batch_size = 2048
 epochs = 200
 
 # Training mode
@@ -26,7 +26,7 @@ unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
 # NCDE model parameters
 cde_state_dim = 16
 init_hidden_dim = 32
-vf_hidden_dim = 64
+vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
 out_size = 1

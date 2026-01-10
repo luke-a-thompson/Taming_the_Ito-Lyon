@@ -53,7 +53,7 @@ def solve_cde_from_windowed_logsigs(
         solver=solver,
         t0=ts[0],
         t1=ts[-1],
-        dt0=None,
+        dt0=0.1 if isinstance(stepsize_controller, diffrax.ConstantStepSize) else None,
         y0=y0,
         stepsize_controller=stepsize_controller,
         saveat=saveat,

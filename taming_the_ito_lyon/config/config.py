@@ -13,12 +13,11 @@ from taming_the_ito_lyon.config.config_options import (
     Optimizer,
     ModelType,
     Datasets,
-    ExtrapolationScheme,
+    ExtrapolationSchemeType,
     LossType,
     HopfAlgebraType,
     TrainingMode,
     UnconditionalDriverKind,
-    FinalActivation,
 )
 
 
@@ -67,16 +66,12 @@ class ExperimentConfig(BaseModel):
         return self
 
     # Extrapolation settings
-    extrapolation_scheme: ExtrapolationScheme | None = Field(
+    extrapolation_scheme: ExtrapolationSchemeType | None = Field(
         default=None, description="Extrapolation scheme"
     )
     n_recon: PositiveInt | None = Field(
         default=None,
         description="Number of reconstruction points for extrapolation (None for standard mode)",
-    )
-    n_future: PositiveInt | None = Field(
-        default=None,
-        description="Number of future points for extrapolation (None for standard mode)",
     )
 
     @model_validator(mode="after")
@@ -92,15 +87,6 @@ class ExperimentConfig(BaseModel):
                 raise ValueError(
                     "extrapolation_scheme is only supported for model_type in "
                     "{ncde, log_ncde, mnrde}."
-                )
-            if self.n_recon is None or self.n_future is None:
-                raise ValueError(
-                    "n_recon and n_future must be specified when extrapolation_scheme is provided"
-                )
-        else:
-            if self.n_recon is not None or self.n_future is not None:
-                raise ValueError(
-                    "n_recon and n_future must be None when extrapolation_scheme is not provided"
                 )
         return self
 
@@ -124,6 +110,16 @@ class ExperimentConfig(BaseModel):
     epochs: PositiveInt = Field(description="Number of epochs")
     early_stopping_patience: PositiveInt = Field(
         default=25, description="Epochs with no val improvement before stopping"
+    )
+
+    # Performance / logging
+    tqdm_update_interval: PositiveInt = Field(
+        default=10,
+        description=(
+            "Update tqdm postfix every N steps. Note: updating postfix typically "
+            "requires syncing JAX device arrays to host, so larger values improve "
+            "training throughput."
+        ),
     )
 
     @model_validator(mode="after")
@@ -262,6 +258,9 @@ class NRDEConfig(BaseModel):
     # Model params
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
+    init_hidden_dim: PositiveInt = Field(
+        description="Initial condition MLP hidden state dimension"
+    )
     initial_cond_mlp_depth: PositiveInt = Field(
         description="Initial condition MLP depth (number of hidden layers)"
     )
@@ -285,7 +284,7 @@ class MNRDEConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Model params
-    initial_hidden_dim: PositiveInt = Field(
+    init_hidden_dim: PositiveInt = Field(
         description="Initial condition MLP hidden state dimension"
     )
     initial_cond_mlp_depth: PositiveInt = Field(
@@ -316,6 +315,9 @@ class LogNCDEConfig(BaseModel):
     # Model params
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     vf_hidden_dim: PositiveInt = Field(description="Vector field MLP width")
+    init_hidden_dim: PositiveInt = Field(
+        description="Initial condition MLP hidden state dimension"
+    )
     initial_cond_mlp_depth: PositiveInt = Field(
         description="Initial condition MLP depth (number of hidden layers)"
     )

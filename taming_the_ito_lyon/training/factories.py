@@ -28,6 +28,9 @@ import equinox as eqx
 from collections.abc import Callable
 from cyreal.transforms import BatchTransform, DevicePutTransform
 from cyreal.loader import DataLoader
+from taming_the_ito_lyon.training.results_gathering_fns import (
+    ResultsGatheringFn,
+)
 
 
 def _maybe_create_extrapolation_scheme(
@@ -52,7 +55,7 @@ def _maybe_create_extrapolation_scheme(
 
     model_key, scheme_key = jax.random.split(key)
     extrapolation_scheme = create_scheme(
-        scheme_enum.value,
+        scheme_enum,
         num_points=n_recon,
         input_dim=input_path_dim,
         key=scheme_key,
@@ -91,6 +94,7 @@ def create_model(
             return LogNCDE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
+                init_hidden_dim=config.nn_config.init_hidden_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
                 vf_mlp_depth=config.nn_config.vf_mlp_depth,
@@ -106,6 +110,7 @@ def create_model(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
+                init_hidden_dim=config.nn_config.init_hidden_dim,
                 initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
                 vf_mlp_depth=config.nn_config.vf_mlp_depth,
                 output_path_dim=output_path_dim,
@@ -117,7 +122,7 @@ def create_model(
             return MNDRE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
-                initial_hidden_dim=config.nn_config.initial_hidden_dim,
+                initial_hidden_dim=config.nn_config.init_hidden_dim,
                 vf_hidden_dim=config.nn_config.vf_hidden_dim,
                 initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
                 vf_mlp_depth=config.nn_config.vf_mlp_depth,
@@ -320,7 +325,9 @@ def create_unconditional_control_sampler_batched(
         keys = jr.split(key, batch_size)
         return jax.vmap(lambda k: single_sampler(ts, k))(keys)
 
-    return sample_batch
+    # JIT this so unconditional mode doesn't run eager JAX work each step.
+    # Compiles once per distinct (static) batch_size.
+    return jax.jit(sample_batch, static_argnames=("batch_size",))
 
 
 def create_grad_batch_loss_fns(
@@ -343,6 +350,7 @@ def create_grad_batch_loss_fns(
         mse_loss,
         rotational_geodesic_loss,
         truncated_sig_loss_time_augmented,
+        frobenius_loss,
     )
 
     match loss_type:
@@ -350,6 +358,8 @@ def create_grad_batch_loss_fns(
             loss_fn = mse_loss
         case LossType.RGE:
             loss_fn = rotational_geodesic_loss
+        case LossType.FROBENIUS:
+            loss_fn = frobenius_loss
         case LossType.SIGKER:
             if output_path_dim is None:
                 raise ValueError(
@@ -387,7 +397,7 @@ def configure_jax() -> None:
     """Configure global JAX settings (matmul precision and persistent compilation cache)."""
     import os
 
-    jax.config.update("jax_default_matmul_precision", "high")
+    jax.config.update("jax_default_matmul_precision", "tensorfloat32")
     jax.config.update("jax_enable_compilation_cache", True)
     jax.config.update(
         "jax_compilation_cache_max_size",
@@ -396,3 +406,25 @@ def configure_jax() -> None:
     cache_dir = os.path.abspath("jax_cache")
     os.makedirs(cache_dir, exist_ok=True)
     jax.config.update("jax_compilation_cache_dir", cache_dir)
+
+
+def create_results_gathering_fn(
+    config: Config,
+) -> ResultsGatheringFn:
+    match config.experiment_config.dataset_name:
+        case Datasets.BLACK_SCHOLES | Datasets.BERGOMI | Datasets.ROUGH_BERGOMI:
+            from taming_the_ito_lyon.training.results_gathering_fns import (
+                get_rough_volatility_results,
+            )
+
+            return get_rough_volatility_results
+        case Datasets.SG_SO3_SIMULATION:
+            from taming_the_ito_lyon.training.results_gathering_fns import (
+                get_sg_so3_simulation_results,
+            )
+
+            return get_sg_so3_simulation_results
+        case _:
+            raise ValueError(
+                f"Unknown dataset name: {config.experiment_config.dataset_name}"
+            )

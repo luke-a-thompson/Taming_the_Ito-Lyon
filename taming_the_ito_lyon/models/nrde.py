@@ -93,6 +93,7 @@ class NeuralRDE(eqx.Module):
         cde_state_dim: int,
         output_path_dim: int,
         vf_hidden_dim: int,
+        init_hidden_dim: int,
         initial_cond_mlp_depth: int,
         vf_mlp_depth: int,
         signature_depth: int,
@@ -113,7 +114,7 @@ class NeuralRDE(eqx.Module):
         self.initial = eqx.nn.MLP(
             in_size=input_path_dim,
             out_size=cde_state_dim,
-            width_size=vf_hidden_dim,
+            width_size=init_hidden_dim,
             depth=initial_cond_mlp_depth,
             activation=jnn.softplus,
             key=k1,

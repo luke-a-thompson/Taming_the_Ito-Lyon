@@ -1,4 +1,4 @@
-from .config_options import ModelType, Optimizer, ExtrapolationScheme, Datasets
+from .config_options import ModelType, Optimizer, ExtrapolationSchemeType, Datasets
 from .config import (
     Config,
     ExperimentConfig,
@@ -13,7 +13,7 @@ from .config import (
 __all__ = [
     "ModelType",
     "Optimizer",
-    "ExtrapolationScheme",
+    "ExtrapolationSchemeType",
     "Datasets",
     "Config",
     "ExperimentConfig",

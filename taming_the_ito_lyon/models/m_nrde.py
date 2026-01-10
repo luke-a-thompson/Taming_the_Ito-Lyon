@@ -150,12 +150,13 @@ class MNDRE(eqx.Module):
         hopf_algebra_type: HopfAlgebraType,
         key: jax.Array,
         manifold: Manifold = EuclideanSpace(),
-        readout_activation: Callable[[jax.Array], jax.Array] = jnn.tanh,
+        readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         evolving_out: bool = True,
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
-        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
-            rtol=1e-2, atol=1e-3, dtmin=1e-6
-        ),
+        # stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
+        #     rtol=1e-2, atol=1e-3, dtmin=1e-6
+        # ),
+        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.ConstantStepSize(),
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
     ) -> None:

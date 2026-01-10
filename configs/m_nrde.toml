@@ -5,7 +5,6 @@ dataset_name = "rough_bergomi"
 # Extrapolation settings
 # extrapolation_scheme = "sg"
 # n_recon = 12
-# n_future = 3
 
 # Optimizer
 optimizer = "adam"

@@ -8,13 +8,14 @@ and return a control path that covers the full time range
 
 from __future__ import annotations
 from abc import abstractmethod
-from typing import Protocol, Literal
+from typing import Protocol
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import diffrax
 from diffrax._custom_types import RealScalarLike
+from taming_the_ito_lyon.config.config_options import ExtrapolationSchemeType
 
 
 class ExtrapolationScheme(Protocol):
@@ -63,12 +64,14 @@ class LinearScheme(eqx.Module):
             )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
+        # Prepend time channel: (n_recon, D) -> (n_recon, 1+D)
+        ys_with_time = jnp.concatenate([t_recon[:, None], x_recon], axis=1)
         # Fit only on reconstruction data - diffrax will extrapolate linearly
-        control = diffrax.LinearInterpolation(ts=t_recon, ys=x_recon)
+        control = diffrax.LinearInterpolation(ts=t_recon, ys=ys_with_time)
         return control, t_all
 
 
-class CubicScheme(eqx.Module):
+class HermiteScheme(eqx.Module):
     """Cubic spline on reconstruction, polynomial extrapolation for future.
 
     - Within t_recon: cubic spline interpolation
@@ -87,8 +90,10 @@ class CubicScheme(eqx.Module):
             )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
+        # Prepend time channel: (n_recon, D) -> (n_recon, 1+D)
+        ys_with_time = jnp.concatenate([t_recon[:, None], x_recon], axis=1)
         # Fit only on reconstruction data - diffrax will extrapolate
-        coeffs = diffrax.backward_hermite_coefficients(ts=t_recon, ys=x_recon)
+        coeffs = diffrax.backward_hermite_coefficients(ts=t_recon, ys=ys_with_time)
         control = diffrax.CubicInterpolation(ts=t_recon, coeffs=coeffs)
         return control, t_all
 
@@ -123,7 +128,7 @@ class WeightedSGScheme(eqx.Module):
         """Create polynomial path that extrapolates smoothly to future."""
         if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
             raise ValueError(
-                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+                f"t_all (shape {t_all.shape}) and x_all (shape {x_all.shape}) must have length >= n_recon ({n_recon})"
             )
         t_recon = t_all[:n_recon]
         x_recon = x_all[:n_recon]
@@ -183,6 +188,8 @@ class _PolynomialPath(diffrax.AbstractPath):
     poly_coeffs: jax.Array  # (D, poly_order+1)
     t_center: jax.Array
     normalizers: jax.Array
+    powers_phi: jax.Array  # (poly_order+1,)
+    powers_first: jax.Array  # (poly_order,)
     t0: RealScalarLike  # type: ignore
     t1: RealScalarLike  # type: ignore
 
@@ -197,6 +204,14 @@ class _PolynomialPath(diffrax.AbstractPath):
         object.__setattr__(self, "poly_coeffs", poly_coeffs)
         object.__setattr__(self, "t_center", t_center)
         object.__setattr__(self, "normalizers", normalizers)
+        poly_order = poly_coeffs.shape[1] - 1
+        # Pre-compute power arrays for efficient derivative computation
+        object.__setattr__(
+            self, "powers_phi", jnp.arange(poly_order + 1, dtype=jnp.float32)
+        )
+        object.__setattr__(
+            self, "powers_first", jnp.arange(poly_order, dtype=jnp.float32)
+        )
         object.__setattr__(self, "t0", t0)
         object.__setattr__(self, "t1", t1)
 
@@ -204,12 +219,45 @@ class _PolynomialPath(diffrax.AbstractPath):
         del left
         if t1 is None:
             t_rel = t0 - self.t_center
-            poly_order = self.poly_coeffs.shape[1] - 1
-            powers = jnp.arange(poly_order + 1)
-            t_powers = (t_rel**powers) / self.normalizers
-            return self.poly_coeffs @ t_powers
+            t_powers = (t_rel**self.powers_phi) / self.normalizers
+            x_t = self.poly_coeffs @ t_powers
+            # Prepend time channel: (D,) -> (1+D,)
+            return jnp.concatenate([jnp.array([t0]), x_t])
         else:
             return self.evaluate(t1) - self.evaluate(t0)
+
+    def derivative(self, t, left=True, order=1):
+        """Compute time derivative using analytic polynomial derivative.
+
+        Args:
+            t: Time point for derivative evaluation
+            left: Not used for deterministic paths
+            order: Derivative order (only 1 is currently supported)
+
+        Returns:
+            First derivative vector of shape (1+D,) = [1, dx/dt]
+        """
+        del left
+        if order != 1:
+            raise ValueError(f"Only derivative order 1 is supported, got {order}")
+
+        t_rel = t - self.t_center
+        # For derivative: d/dt [t^k / max(1,k)] =
+        #   - k=0: 0 (constant term)
+        #   - k>=1: t^(k-1) (no extra normalizer needed for derivative)
+        # So we use coeffs[:, 1:] with powers_first = arange(poly_order)
+        if self.poly_coeffs.shape[1] > 1:
+            # Derivative coefficients: skip constant term
+            deriv_coeffs = self.poly_coeffs[:, 1:]  # (D, poly_order)
+            t_powers_deriv = t_rel**self.powers_first  # (poly_order,)
+            x_dot = deriv_coeffs @ t_powers_deriv  # (D,)
+        else:
+            # Constant polynomial (order 0) has zero derivative
+            x_dot = jnp.zeros(self.poly_coeffs.shape[0])
+
+        # Time derivative is constant 1.0
+        # Return shape (1+D,) = [1, dx/dt]
+        return jnp.concatenate([jnp.array([1.0]), x_dot])
 
 
 class MLPScheme(eqx.Module):
@@ -301,13 +349,15 @@ class _MLPPath(diffrax.AbstractPath):
             t_norm = (t0 - self.t0) / (self.t1 - self.t0 + 1e-8)
             # Concatenate time and context
             mlp_input = jnp.concatenate([jnp.atleast_1d(t_norm), self.context])
-            return self.decoder(mlp_input)
+            x_t = self.decoder(mlp_input)
+            # Prepend time channel: (D,) -> (1+D,)
+            return jnp.concatenate([jnp.array([t0]), x_t])
         else:
             return self.evaluate(t1) - self.evaluate(t0)
 
 
 def create_scheme(
-    name: Literal["linear", "cubic", "sg", "mlp"],
+    name: ExtrapolationSchemeType,
     *,
     input_dim: int | None = None,
     num_points: int | None = None,
@@ -319,7 +369,7 @@ def create_scheme(
     """Factory function for extrapolation schemes.
 
     Args:
-        name: One of 'linear', 'cubic', 'sg', 'mlp'
+        name: One of ExtrapolationSchemeType
         input_dim: Required for 'mlp' scheme
         num_points: Required for 'sg' scheme (reconstruction sequence length)
         poly_order: Polynomial order for 'sg' scheme (default: 3)
@@ -332,15 +382,15 @@ def create_scheme(
 
     Extrapolation behavior:
         - 'linear': Linear continuation from last segment
-        - 'cubic': Polynomial from last cubic segment (can be unstable)
+        - 'hermite': Polynomial from last cubic segment (can be unstable)
         - 'sg': Smooth polynomial extrapolation (fitted to all recon data)
         - 'mlp': Learned extrapolation (MLP outputs for any time)
     """
     match name:
         case "linear":
             return LinearScheme()
-        case "cubic":
-            return CubicScheme()
+        case "hermite":
+            return HermiteScheme()
         case "sg":
             if num_points is None or key is None:
                 raise ValueError("'sg' scheme requires num_points and key")
@@ -359,5 +409,5 @@ def create_scheme(
             )
         case _:
             raise ValueError(
-                f"Unknown scheme: {name}. Use 'linear', 'cubic', 'sg', or 'mlp'"
+                f"Unknown scheme: {name}. Use 'linear', 'hermite', 'sg', or 'mlp'"
             )

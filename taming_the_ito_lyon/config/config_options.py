@@ -40,9 +40,9 @@ class HopfAlgebraType(StrEnum):
     MKW = "mkw"
 
 
-class ExtrapolationScheme(StrEnum):
+class ExtrapolationSchemeType(StrEnum):
     LINEAR = "linear"
-    CUBIC = "cubic"
+    HERMITE = "hermite"
     SG = "sg"
     MLP = "mlp"
 
@@ -51,6 +51,7 @@ class LossType(StrEnum):
     MSE = "mse"
     RGE = "rge"
     SIGKER = "sigker"
+    FROBENIUS = "frobenius"
 
 
 class TrainingMode(StrEnum):
@@ -62,6 +63,7 @@ class UnconditionalDriverKind(StrEnum):
     BM = "bm"
     FBM = "fbm"
     RL = "rl"
+
 
 class FinalActivation(StrEnum):
     TANH = "tanh"

@@ -1,5 +1,5 @@
 [experiment_config]
-model_type = "nrde"
+model_type = "log_ncde"
 dataset_name = "rough_bergomi"
 
 # Optimizer
@@ -12,7 +12,7 @@ max_grad_norm = 1.0
 loss = "sigker"
 seed = 1
 batch_size = 2048
-epochs = 100
+epochs = 200
 
 # Training mode
 training_mode = "unconditional"
@@ -21,10 +21,10 @@ unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
 unconditional_driver_dim = 1     # number of non-time channels
 unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
 
-[nrde_config]
+[log_ncde_config]
 
-# NRDE model parameters
-cde_state_dim = 16
+# Log-NCDE model parameters
+cde_state_dim = 16         # Jacobian burden, quadratic in this
 init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2

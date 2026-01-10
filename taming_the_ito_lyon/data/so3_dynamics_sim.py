@@ -28,6 +28,10 @@ class SO3DynamicsSim(DatasetProtocol):
         self.ordering = "shuffle" if self.split == "train" else "sequential"
 
         data = np.load(self.config.experiment_config.dataset_name.value)
+        dt_sim = float(np.asarray(data["dt"]))
+        skip = int(0.1 / dt_sim)
+        if skip < 1:
+            skip = 1
 
         train_fraction = float(self.config.experiment_config.train_fraction)
         val_fraction = float(self.config.experiment_config.val_fraction)
@@ -44,6 +48,12 @@ class SO3DynamicsSim(DatasetProtocol):
         batch_size, timesteps, boxes, _, _ = rotmats.shape
         # (Batch * 4, Timesteps, 9)
         rotmats_flat = rotmats.reshape(batch_size * boxes, timesteps, 9)
+        # Downsample first, then build 20-step windows on the downsampled sequence.
+        # This makes each window correspond to indices:
+        #   start : start + skip*20 : skip
+        # on the original simulation grid, while the sliding-window stride is 1 on
+        # the downsampled grid.
+        rotmats_flat = rotmats_flat[:, ::skip, :]
         # NOTE: `prepare_seq_to_seq_windows` returns NumPy arrays. With the updated
         # `cyreal.datasets.time_utils.sliding_window_many`, these are typically
         # *views* (stride-trick windows), not fully materialized copies.
@@ -55,6 +65,7 @@ class SO3DynamicsSim(DatasetProtocol):
             target_window_len=20,
             train_fraction=train_fraction,
             val_fraction=val_fraction,
+            sliding_window_stride=1,
         )
 
         # `np.lib.stride_tricks.sliding_window_view` appends the window axis at the end,
@@ -98,9 +109,14 @@ class SO3DynamicsSim(DatasetProtocol):
             raise IndexError(f"Index out of range: {index} (len={self._dataset_len})")
         wi = index % self._num_windows
         bi = index // self._num_windows
+        driver = jnp.asarray(self._driver_np[bi, wi], dtype=jnp.float32)  # (T, 9)
+        solution_flat = jnp.asarray(
+            self._solution_np[bi, wi], dtype=jnp.float32
+        )  # (T, 9)
+        solution = solution_flat.reshape(solution_flat.shape[0], 3, 3)  # (T, 3, 3)
         return {
-            "driver": jnp.asarray(self._driver_np[bi, wi], dtype=jnp.float32),
-            "solution": jnp.asarray(self._solution_np[bi, wi], dtype=jnp.float32),
+            "driver": driver,
+            "solution": solution,
         }
 
     def make_disk_source(
@@ -115,6 +131,10 @@ class SO3DynamicsSim(DatasetProtocol):
             raise ValueError(
                 f"Driver/solution channel mismatch: driver={channels}, solution={channels2}"
             )
+        if int(channels) != 9:
+            raise ValueError(
+                f"Expected SO(3) rotations flattened as 9 channels, got channels={channels}"
+            )
 
         num_windows = int(self._num_windows)
 
@@ -122,18 +142,19 @@ class SO3DynamicsSim(DatasetProtocol):
             idx = int(np.asarray(index))
             wi = idx % num_windows
             bi = idx // num_windows
+            driver = np.asarray(driver_np[bi, wi], dtype=np.float32)  # (T, 9)
+            solution_flat = np.asarray(solution_np[bi, wi], dtype=np.float32)  # (T, 9)
+            solution = solution_flat.reshape(int(tgt_len), 3, 3)  # (T, 3, 3)
             return {
-                "driver": np.asarray(driver_np[bi, wi], dtype=np.float32),
-                "solution": np.asarray(solution_np[bi, wi], dtype=np.float32),
+                "driver": driver,
+                "solution": solution,
             }
 
         sample_spec = {
             "driver": jax.ShapeDtypeStruct(
                 shape=(ctx_len, channels), dtype=jnp.float32
             ),
-            "solution": jax.ShapeDtypeStruct(
-                shape=(tgt_len, channels), dtype=jnp.float32
-            ),
+            "solution": jax.ShapeDtypeStruct(shape=(tgt_len, 3, 3), dtype=jnp.float32),
         }
 
         return DiskSource(
@@ -141,5 +162,5 @@ class SO3DynamicsSim(DatasetProtocol):
             sample_fn=_read_sample,
             sample_spec=sample_spec,
             ordering=self.ordering,
-            prefetch_size=128,
+            prefetch_size=self.config.experiment_config.batch_size,
         )
