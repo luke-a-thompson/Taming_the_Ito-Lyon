@@ -1,4 +1,5 @@
 import atexit
+import dataclasses
 import json
 import jax
 import jax.random as jr
@@ -31,7 +32,7 @@ from taming_the_ito_lyon.config import (
 )
 from taming_the_ito_lyon.config.config_options import TrainingMode
 from taming_the_ito_lyon.models import Model
-from taming_the_ito_lyon.config.config_options import Datasets, LossType
+from taming_the_ito_lyon.config.config_options import Datasets
 
 SAVED_MODELS_DIR = "saved_models"
 
@@ -72,7 +73,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         # Model consumes (time + sampled driver channels)
         uncond_dim = config.experiment_config.unconditional_driver_dim
         assert uncond_dim is not None
-        input_path_dim = int(uncond_dim) + 1
+        input_path_dim = int(uncond_dim) + 1  # time concat
+    elif config.experiment_config.extrapolation_scheme is not None:
+        input_path_dim = int(input_channels) + 1  # time concat
     else:
         input_path_dim = input_channels
 
@@ -114,7 +117,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         )
 
     grad_fn, batch_loss_fn = create_grad_batch_loss_fns(
-        loss_type=config.experiment_config.loss,
+        config=config,
         # Only used for SIGKER; for SO3+RGE we keep targets as (3,3) matrices.
         output_path_dim=int(output_head_dim),
     )
@@ -245,8 +248,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         # Keep accumulation on-device to avoid syncing every step.
         total_loss = jnp.asarray(0.0, dtype=jnp.float32)
         tqdm_every = int(config.experiment_config.tqdm_update_interval)
-        preds_batches: list[jax.Array] = []
-        targets_batches: list[jax.Array] = []
+        # Only keep a single batch for plotting/diagnostics (avoid O(n_batches) memory).
+        preds0: jax.Array | None = None
+        targets0: jax.Array | None = None
 
         pbar = tqdm(
             range(loader.steps_per_epoch),
@@ -277,19 +281,23 @@ def experiment(config: Config, config_path: str | None = None) -> None:
                 loss_host = float(jax.device_get(loss_value))
                 pbar.set_postfix({f"val_{loss_label}": f"{loss_host * 1e2:.3f}×10⁻²"})
 
-            preds_batches.append(predict_batch(control_values_b, model))
-            targets_batches.append(batch["solution"])
+            # Save only the first batch for visualization.
+            if step_idx == 0:
+                preds0 = predict_batch(control_values_b, model)
+                targets0 = batch["solution"]
 
         steps = max(1, int(loader.steps_per_epoch))
         avg_loss = float(jax.device_get(total_loss)) / float(steps)
 
-        # Compute KS test if predictions were collected
+        # Compute diagnostics (plots/KS/etc.) using only the first batch.
+        assert preds0 is not None and targets0 is not None
         results_dict = results_gathering_fn(
-            preds_batches,
-            targets_batches,
+            preds0,
+            targets0,
             epoch_idx,
             times_to_save=[-1],
-            n_plot=batch_size,
+            # Don't spam plots with hundreds of trajectories.
+            n_plot=min(8, int(batch_size)),
         )
         return avg_loss, results_dict, loader_state
 
@@ -405,7 +413,7 @@ def experiment(config: Config, config_path: str | None = None) -> None:
             "min_val": min_val_metric,
             "min_train": min_train_loss,
         },
-        "test_results_dict": test_results_dict,
+        "test_results_dict": dataclasses.asdict(test_results_dict),
     }
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)

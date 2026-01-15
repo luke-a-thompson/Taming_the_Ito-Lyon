@@ -1,9 +1,9 @@
 [experiment_config]
-model_type = "ncde"
+model_type = "gru"
 dataset_name = "sg_so3_simulation"
 
 # Extrapolation settings
-extrapolation_scheme = "sg"
+extrapolation_scheme = "hermite"
 n_recon = 12
 
 # Optimizer
@@ -13,7 +13,7 @@ weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
-loss = "rge"
+loss = "frobenius"
 seed = 1
 batch_size = 512
 epochs = 200
@@ -25,17 +25,20 @@ training_mode = "conditional"
 # unconditional_driver_dim = 1       # number of non-time channels
 # unconditional_hurst = 0.1          # used for "fbm"/"rl"
 
-[ncde_config]
+manifold = "so3"
+hidden_manifold = "euclidean"
+evolving_out = true
 
-# NCDE model parameters
-cde_state_dim = 16
+[solver_config]
+stepsize_controller = "pid"
+rtol = 1e-2
+atol = 1e-3
+dtmin = 1e-4
+
+[gru_config]
+
+# GRU model parameters
+gru_state_dim = 16
 init_hidden_dim = 32
-vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
-vf_mlp_depth = 3
 out_size = 6
-
-# Solver tolerances
-rtol = 0.001
-atol = 0.000001
-dtmin = 1e-6

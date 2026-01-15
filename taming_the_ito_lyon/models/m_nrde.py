@@ -26,7 +26,7 @@ from stochastax.vector_field_lifts.vector_field_lift_types import (
     VectorFieldBracketFunctions,
     VectorFieldBracketFunctionLift,
 )
-from stochastax.manifolds import Manifold, EuclideanSpace
+from stochastax.manifolds import Manifold
 from .logsignatures import (
     compute_windowed_logsignatures_from_values,
 )
@@ -45,7 +45,7 @@ class MNRDEFunc(eqx.Module):
     input_path_dim: int
     vf_mlp: eqx.nn.MLP
     cde_state_dim: int
-    manifold: Manifold = eqx.field(static=True)
+    hidden_manifold: type[Manifold] = eqx.field(static=True)
     hopf_algebra: HopfAlgebra = eqx.field(static=True)
     vf_lift: VectorFieldBracketFunctionLift = eqx.field(static=True)
 
@@ -58,7 +58,7 @@ class MNRDEFunc(eqx.Module):
         vf_mlp_depth: int,
         hopf_algebra: HopfAlgebra,
         vf_lift: VectorFieldBracketFunctionLift,
-        manifold: Manifold = EuclideanSpace(),
+        hidden_manifold: type[Manifold],
         key: jax.Array,
     ) -> None:
         # Vector field
@@ -75,30 +75,30 @@ class MNRDEFunc(eqx.Module):
         )
 
         # Rough paths
-        self.manifold = manifold
+        self.hidden_manifold = hidden_manifold
         self.hopf_algebra = hopf_algebra
         self.vf_lift = vf_lift
 
     def __call__(self, t: jax.typing.ArrayLike, y: jax.Array, args: None) -> jax.Array:
         del t, args
 
-        y_proj = self.manifold.retract(y)
+        y_retracted = self.hidden_manifold.retract(y)
+        # One driving channel per vector field
         vector_fields = split_multi_vector_field(
             self.vf_mlp, self.input_path_dim, self.cde_state_dim
         )
+        # Form the bracket functions for the vector fields
         bracket_functions: VectorFieldBracketFunctions = self.vf_lift(
             vector_fields,
             self.hopf_algebra,
-            self.manifold,
+            self.hidden_manifold(),
         )
 
-        flat_bracket_functions = [
-            bf
-            for level in bracket_functions
-            for bf in level  # type: ignore[union-attr]
-        ]
+        # Flatten the bracket functions to a single list of length m (logsig_size)
+        flat_bracket_functions = [bf for level in bracket_functions for bf in level]
+        # Back to tangent space. THIS EVALUATES vf_mlp(y)
         cols = [
-            self.manifold.project_to_tangent(y_proj, bf(y_proj))
+            self.hidden_manifold.project_to_tangent(y_retracted, bf(y_retracted))
             for bf in flat_bracket_functions
         ]
         return jnp.stack(cols, axis=1)
@@ -125,7 +125,8 @@ class MNDRE(eqx.Module):
     # Static configuration
     hopf_algebra: HopfAlgebra = eqx.field(static=True)
     vf_lift: VectorFieldBracketFunctionLift = eqx.field(static=True)
-    manifold: Manifold = eqx.field(static=True)
+    data_manifold: type[Manifold] = eqx.field(static=True)
+    hidden_manifold: type[Manifold] = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     signature_depth: int = eqx.field(static=True)
     signature_window_size: int = eqx.field(static=True)
@@ -144,26 +145,25 @@ class MNDRE(eqx.Module):
         initial_cond_mlp_depth: int,
         vf_hidden_dim: int,
         vf_mlp_depth: int,
-        *,
         signature_depth: int,
         signature_window_size: int,
-        hopf_algebra_type: HopfAlgebraType,
+        *,
         key: jax.Array,
-        manifold: Manifold = EuclideanSpace(),
+        data_manifold: type[Manifold],
+        hidden_manifold: type[Manifold],
+        hopf_algebra_type: HopfAlgebraType,
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
+        stepsize_controller: diffrax.AbstractStepSizeController,
         readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         evolving_out: bool = True,
-        solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
-        # stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
-        #     rtol=1e-2, atol=1e-3, dtmin=1e-6
-        # ),
-        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.ConstantStepSize(),
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
 
         # Rough paths
-        self.manifold = manifold
+        self.data_manifold = data_manifold
+        self.hidden_manifold = hidden_manifold
         self.signature_depth = signature_depth
         self.signature_window_size = signature_window_size
         match hopf_algebra_type:
@@ -199,7 +199,7 @@ class MNDRE(eqx.Module):
             vf_mlp_depth=vf_mlp_depth,
             hopf_algebra=self.hopf_algebra,
             vf_lift=self.vf_lift,
-            manifold=self.manifold,
+            hidden_manifold=self.data_manifold,
             key=k2,
         )
         self.readout_layer = eqx.nn.Linear(
@@ -222,21 +222,25 @@ class MNDRE(eqx.Module):
 
         def apply_single(y: jax.Array) -> jax.Array:
             activation = self.readout_activation(self.readout_layer(y))
-            retracted = self.manifold.retract(activation)
+            retracted = self.data_manifold.retract(activation)
             return retracted
 
         return jax.vmap(apply_single)(hidden_states)
 
-    def _forward_from_logsigs(
-        self, ts: jax.Array, x0: jax.Array, logsigs: jax.Array
+    def _forward_with_values(
+        self,
+        ts: jax.Array,
+        control_values: jax.Array,
     ) -> jax.Array:
-        """Solve the induced CDE given initial input `x0` and disjoint window log-signatures.
-
-        This is the shared core used by both:
-        - control-path mode (compute logsigs via `control.evaluate(ts)`), and
-        - value mode (compute logsigs directly from sampled values).
-        """
-        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
+        """Core forward pass given sampled control values (standard mode fast path)."""
+        x0 = control_values[0]
+        logsigs = compute_windowed_logsignatures_from_values(
+            control_values,
+            self.hopf_algebra,
+            self.signature_depth,
+            self.signature_window_size,
+        )
+        h0 = self.initial_cond_mlp(x0)
 
         ys = solve_cde_from_windowed_logsigs(
             ts,
@@ -247,41 +251,7 @@ class MNDRE(eqx.Module):
             solver=self.solver,
             stepsize_controller=self.stepsize_controller,
         )
-        return jax.vmap(self.manifold.retract)(ys)
-
-    def _forward_with_control(
-        self,
-        ts: jax.Array,
-        control: diffrax.AbstractPath,
-    ) -> jax.Array:
-        """Core forward pass given control path, solved via diffrax.diffeqsolve.
-
-        We compute disjoint-window log-signatures (flattened), build their cumulative
-        sum as a piecewise-linear control path in log-signature space, and solve the
-        induced controlled differential equation with Diffrax.
-        """
-        x0 = control.evaluate(ts[0])
-        control_values = jax.vmap(control.evaluate)(ts)
-        logsigs = compute_windowed_logsignatures_from_values(
-            control_values,
-            self.hopf_algebra,
-            self.signature_depth,
-            self.signature_window_size,
-        )
-        return self._forward_from_logsigs(ts, x0, logsigs)
-
-    def _forward_with_values(
-        self, ts: jax.Array, control_values: jax.Array
-    ) -> jax.Array:
-        """Core forward pass given sampled control values (standard mode fast path)."""
-        x0 = control_values[0]
-        logsigs = compute_windowed_logsignatures_from_values(
-            control_values,
-            self.hopf_algebra,
-            self.signature_depth,
-            self.signature_window_size,
-        )
-        return self._forward_from_logsigs(ts, x0, logsigs)
+        return ys
 
     def __call__(
         self,
@@ -302,8 +272,11 @@ class MNDRE(eqx.Module):
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, control_values, self.n_recon)
-            hidden = self._forward_with_control(ts, control)
+            control, _ = self.extrapolation_scheme.create_control(
+                ts, control_values, self.n_recon
+            )
+            control_values = jax.vmap(control.evaluate)(ts)
+            hidden = self._forward_with_values(ts, control_values)
             outputs = self._apply_readout(hidden)
 
             return outputs
@@ -314,4 +287,6 @@ class MNDRE(eqx.Module):
             if self.evolving_out:
                 return self._apply_readout(hidden)
 
-            return self.readout_activation(self.readout_layer(hidden[-1]))
+            # Single output case: also convert from 6D to 3x3 (matches `ncde.py`).
+            final_output = self.readout_activation(self.readout_layer(hidden[-1]))
+            return self.data_manifold.retract(final_output)

@@ -14,14 +14,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-import diffrax
 import equinox as eqx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
 
-from stochastax.manifolds import Manifold, EuclideanSpace
+from stochastax.manifolds import Manifold
 
 from .extrapolation import ExtrapolationScheme
 
@@ -35,6 +34,7 @@ class GRU(eqx.Module):
 
     # Static configuration
     manifold: Manifold = eqx.field(static=True)
+    hidden_manifold: Manifold = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
 
@@ -51,8 +51,9 @@ class GRU(eqx.Module):
         initial_cond_mlp_depth: int,
         *,
         key: jax.Array,
-        manifold: Manifold = EuclideanSpace(),
-        readout_activation: Callable[[jax.Array], jax.Array] = jnn.tanh,
+        manifold: Manifold,
+        hidden_manifold: Manifold | None = None,
+        readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         evolving_out: bool = True,
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
@@ -60,6 +61,7 @@ class GRU(eqx.Module):
         k1, k2, k3 = jr.split(key, 3)
 
         self.manifold = manifold
+        self.hidden_manifold = manifold if hidden_manifold is None else hidden_manifold
         self.readout_activation = readout_activation
         self.evolving_out = bool(evolving_out)
         self.extrapolation_scheme = extrapolation_scheme
@@ -83,20 +85,14 @@ class GRU(eqx.Module):
             key=k3,
         )
 
-    def _evaluate_control(
-        self, ts: jax.Array, control: diffrax.AbstractPath
-    ) -> jax.Array:
-        """Evaluate a diffrax control path at discrete timestamps."""
-        return jax.vmap(control.evaluate)(ts)
-
     def _forward_from_x(self, x: jax.Array) -> jax.Array:
         """Run the GRU over a discrete input sequence x of shape (T, C)."""
         x0 = x[0]
-        h0 = self.manifold.retract(self.initial_cond_mlp(x0))
+        h0 = self.hidden_manifold.retract(self.initial_cond_mlp(x0))
 
         def step(h: jax.Array, xt: jax.Array) -> tuple[jax.Array, jax.Array]:
             h_new = self.cell(xt, h)
-            h_new = self.manifold.retract(h_new)
+            h_new = self.hidden_manifold.retract(h_new)
             return h_new, h_new
 
         # We keep h0 as the hidden state at time ts[0] (like diffeqsave does).
@@ -121,8 +117,10 @@ class GRU(eqx.Module):
             assert self.n_recon is not None, (
                 "n_recon must be set when using extrapolation_scheme"
             )
-            control, _ = self.extrapolation_scheme.create_control(ts, control_values, self.n_recon)
-            x_eval = self._evaluate_control(ts, control)
+            control, _ = self.extrapolation_scheme.create_control(
+                ts, control_values, self.n_recon
+            )
+            x_eval = jax.vmap(control.evaluate)(ts)
         else:
             x_eval = control_values
         hidden = self._forward_from_x(x_eval)

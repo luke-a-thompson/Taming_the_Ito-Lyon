@@ -25,6 +25,7 @@ class ModelType(StrEnum):
     LOG_NCDE = "log_ncde"
     NRDE = "nrde"
     MNRDE = "mnrde"
+    GRU = "gru"
     SDEONET = "sdeonet"
 
 
@@ -39,11 +40,21 @@ class HopfAlgebraType(StrEnum):
     GL = "gl"
     MKW = "mkw"
 
+class StepsizeControllerType(StrEnum):
+    PID = "pid"
+    ADAPTIVE = "adaptive"
+
+class ManifoldType(StrEnum):
+    EUCLIDEAN = "euclidean"
+    SO3 = "so3"
+    SPD = "spd"
+
 
 class ExtrapolationSchemeType(StrEnum):
     LINEAR = "linear"
     HERMITE = "hermite"
     SG = "sg"
+    SO3_SG = "so3_sg"
     MLP = "mlp"
 
 

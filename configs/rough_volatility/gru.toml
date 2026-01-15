@@ -1,0 +1,44 @@
+[experiment_config]
+model_type = "gru"
+dataset_name = "rough_bergomi"
+
+# Extrapolation settings
+# extrapolation_scheme = "sg"
+# n_recon = 12
+
+# Optimizer
+optimizer = "adamw"
+learning_rate = 1e-4
+weight_decay = 0.000001
+max_grad_norm = 1.0
+
+# Training
+loss = "sigker"
+seed = 1
+batch_size = 2048
+epochs = 200
+
+# Training mode
+training_mode = "unconditional"
+# To run unconditional generation, switch training_mode and set:
+unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
+unconditional_driver_dim = 1     # number of non-time channels
+unconditional_hurst = 0.5        # used for "fbm"/"rl"
+
+manifold = "euclidean"
+hidden_manifold = "euclidean"
+evolving_out = true
+
+[solver_config]
+stepsize_controller = "pid"
+rtol = 1e-2
+atol = 1e-3
+dtmin = 1e-4
+
+[gru_config]
+
+# GRU model parameters
+gru_state_dim = 16
+init_hidden_dim = 32
+initial_cond_mlp_depth = 2
+out_size = 1

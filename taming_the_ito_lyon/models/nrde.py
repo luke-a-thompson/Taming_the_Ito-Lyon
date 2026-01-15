@@ -98,12 +98,11 @@ class NeuralRDE(eqx.Module):
         vf_mlp_depth: int,
         signature_depth: int,
         signature_window_size: int,
+        *,
         key: jax.Array,
-        readout_activation: Callable[[jax.Array], jax.Array] | None = None,
+        readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
-        stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
-            rtol=1e-2, atol=1e-3, dtmin=1e-6
-        ),
+        stepsize_controller: diffrax.AbstractStepSizeController,
         evolving_out: bool = True,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
@@ -133,9 +132,7 @@ class NeuralRDE(eqx.Module):
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = (
-            readout_activation if readout_activation is not None else (lambda x: x)
-        )
+        self.readout_activation = readout_activation
         self.signature_depth = signature_depth
         self.signature_window_size = signature_window_size
         self.evolving_out = evolving_out

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import Callable
+from taming_the_ito_lyon.config.config import Config
 
 
 def mse_loss(
@@ -14,44 +15,99 @@ def mse_loss(
 
 
 def frobenius_loss(
-    pred: jax.Array,
-    target: jax.Array,
-) -> jax.Array:
-    return jnp.mean(jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1)))
+    config: Config,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """
+    Frobenius loss between predicted and target rotation matrices.
+
+    If extrapolation_scheme is set, we compute the loss on the predicted and target
+    rotation matrices for the reconstruction and future parts separately.
+
+    Args:
+        config: Config object
+
+    Returns:
+        Loss function
+    """
+    n_recon = config.experiment_config.n_recon
+
+    def loss(
+        pred: jax.Array,
+        target: jax.Array,
+    ) -> jax.Array:
+        return jnp.mean(jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1)))
+
+    def extrapolation_loss(pred: jax.Array, target: jax.Array) -> jax.Array:
+        pred = pred[n_recon:]
+        target = target[n_recon:]
+        recon_loss = loss(pred, target)
+        future_loss = loss(target, pred)
+        return recon_loss + future_loss
+
+    if config.experiment_config.extrapolation_scheme is not None:
+        return extrapolation_loss
+    else:
+        return loss
 
 
 def rotational_geodesic_loss(
-    pred: jax.Array,
-    target: jax.Array,
-) -> jax.Array:
+    config: Config,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """
-    Compute the Rotational Geodesic Error (RGE) loss.
+    Rotational Geodesic Error (RGE) loss.
     RGE(R1, R2) = 2 * arcsin(||R2 - R1||_F / (2√2))
 
     Args:
-        pred: Predicted rotation matrices
-        target: Target rotation matrices
-
-    Returns:
-        Mean RGE loss
+        config: Config object
     """
-    assert pred.shape == target.shape, (
-        f"pred and target must have the same shape, got {pred.shape} and {target.shape}"
-    )
-    assert pred.shape[-1] == pred.shape[-2], "pred and target must be square matrices"
-    # NOTE: The closed-form RGE formula assumes both inputs are valid rotation matrices.
-    # In practice, simulator outputs can drift slightly off SO(3) and floating point error
-    # can push the arcsin argument marginally outside [-1, 1], producing NaNs.
-    frobenius_norm = jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1))
-    denom = 2.0 * jnp.sqrt(2.0)
-    ratio = frobenius_norm / denom
-    # Also avoid the arcsin derivative singularity at 1.0, which can create `inf`
-    # gradients and quickly destabilize optimization early in training.
-    eps = jnp.asarray(1e-5, dtype=ratio.dtype)
-    ratio = jnp.clip(ratio, a_min=0.0, a_max=1.0 - eps)
-    rge_rad = 2.0 * jnp.arcsin(ratio)
-    rge_deg = rge_rad * (180.0 / jnp.pi)
-    return jnp.mean(rge_deg)
+    n_recon = config.experiment_config.n_recon
+
+    def loss(
+        pred: jax.Array,
+        target: jax.Array,
+    ) -> jax.Array:
+        """
+        Compute the Rotational Geodesic Error (RGE) loss.
+        RGE(R1, R2) = 2 * arcsin(||R2 - R1||_F / (2√2))
+
+        Args:
+            pred: Predicted rotation matrices
+            target: Target rotation matrices
+
+        Returns:
+            Mean RGE loss
+        """
+        assert pred.shape == target.shape, (
+            f"pred and target must have the same shape, got {pred.shape} and {target.shape}"
+        )
+        assert pred.shape[-1] == pred.shape[-2], (
+            "pred and target must be square matrices"
+        )
+        # NOTE: The closed-form RGE formula assumes both inputs are valid rotation matrices.
+        # In practice, simulator outputs can drift slightly off SO(3) and floating point error
+        # can push the arcsin argument marginally outside [-1, 1], producing NaNs.
+        frobenius_norm = jnp.linalg.norm(pred - target, ord="fro", axis=(-2, -1))
+        denom = 2.0 * jnp.sqrt(2.0)
+        ratio = frobenius_norm / denom
+        # Also avoid the arcsin derivative singularity at 1.0, which can create `inf`
+        # gradients and quickly destabilize optimization early in training.
+        eps = jnp.asarray(1e-5, dtype=ratio.dtype)
+        ratio = jnp.clip(ratio, a_min=0.0, a_max=1.0 - eps)
+        rge_rad = 2.0 * jnp.arcsin(ratio)
+        rge_deg = rge_rad * (180.0 / jnp.pi)
+        return jnp.mean(rge_deg)
+
+    def extrapolation_loss(pred: jax.Array, target: jax.Array) -> jax.Array:
+        pred = pred[n_recon:]
+        target = target[n_recon:]
+        recon_loss = loss(pred, target)
+        future_loss = loss(target, pred)
+        return recon_loss + future_loss
+
+    if config.experiment_config.extrapolation_scheme is not None:
+        return extrapolation_loss
+    else:
+        return loss
 
 
 def truncated_sig_loss(

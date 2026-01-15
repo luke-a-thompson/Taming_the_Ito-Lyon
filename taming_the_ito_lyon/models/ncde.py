@@ -12,7 +12,7 @@ import jax.random as jr
 import diffrax
 from typing import Callable
 
-from stochastax.manifolds import SO3
+from stochastax.manifolds import Manifold
 from .extrapolation import ExtrapolationScheme
 
 
@@ -72,6 +72,7 @@ class NeuralCDE(eqx.Module):
     readout_layer: eqx.nn.Linear
 
     # Static configuration
+    manifold: type[Manifold] = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
 
@@ -94,24 +95,19 @@ class NeuralCDE(eqx.Module):
         vf_mlp_depth: int,
         *,
         key: jax.Array,
-        readout_activation: Callable[[jax.Array], jax.Array] | None = None,
+        manifold: type[Manifold],
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
-        stepsize_controller: diffrax.AbstractStepSizeController | None = None,
-        rtol: float = 1e-2,
-        atol: float = 1e-3,
-        dtmin: float = 1e-6,
-        evolving_out: bool = True,
+        stepsize_controller: diffrax.AbstractStepSizeController,
+        evolving_out: bool,
+        readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
 
-        # Control dimension includes time channel: control_dim = input_path_dim + 1
-        control_path_dim = input_path_dim + 1
-
         # Modules
         self.initial_cond_mlp = eqx.nn.MLP(
-            in_size=control_path_dim,
+            in_size=input_path_dim,
             # The CDE/ODE state dimension must match the vector-field input dimension.
             # `init_hidden_dim` controls the *width* of this MLP, not the output size.
             out_size=cde_state_dim,
@@ -121,7 +117,7 @@ class NeuralCDE(eqx.Module):
             key=k1,
         )
         self.cde_func = CDEFunc(
-            input_path_dim=control_path_dim,
+            input_path_dim=input_path_dim,
             cde_state_dim=cde_state_dim,
             vf_hidden_dim=vf_hidden_dim,
             vf_mlp_depth=vf_mlp_depth,
@@ -133,29 +129,23 @@ class NeuralCDE(eqx.Module):
             use_bias=True,
             key=k3,
         )
-        self.readout_activation = (
-            readout_activation if readout_activation is not None else (lambda x: x)
-        )
 
         # Static configuration
         self.extrapolation_scheme = extrapolation_scheme
         self.n_recon = n_recon
         self.evolving_out = evolving_out
+        self.manifold = manifold
 
         # Solver configuration
         self.solver = solver
-        self.stepsize_controller = (
-            diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin)
-            if stepsize_controller is None
-            else stepsize_controller
-        )
+        self.stepsize_controller = stepsize_controller
 
     def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
         """Apply readout to hidden states, converting from 6D to 3x3 rotation matrices."""
 
         def apply_single(y: jax.Array) -> jax.Array:
             activation = self.readout_activation(self.readout_layer(y))
-            rotmat = SO3.from_6d(activation)
+            rotmat = self.manifold.retract(activation)
             return rotmat
 
         return jax.vmap(apply_single)(hidden_states)
@@ -181,7 +171,7 @@ class NeuralCDE(eqx.Module):
             solver=self.solver,
             t0=ts[0],
             t1=ts[-1],
-            dt0=None,
+            dt0=1,
             y0=y0,
             stepsize_controller=self.stepsize_controller,
             saveat=saveat,
@@ -219,7 +209,9 @@ class NeuralCDE(eqx.Module):
             return outputs
         else:
             # Standard mode: build interpolation from raw values.
-            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=control_values)
+            # Prepend time channel to match extrapolation scheme format
+            ys_with_time = jnp.concatenate([ts[:, None], control_values], axis=1)
+            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=ys_with_time)
             control = diffrax.CubicInterpolation(ts, coeffs)
             hidden = self._forward_with_control(ts, control)
 
@@ -228,4 +220,4 @@ class NeuralCDE(eqx.Module):
 
             # Single output case: also convert from 6D to 3x3
             final_output = self.readout_activation(self.readout_layer(hidden[-1]))
-            return SO3.from_6d(final_output)
+            return self.manifold.retract(final_output)

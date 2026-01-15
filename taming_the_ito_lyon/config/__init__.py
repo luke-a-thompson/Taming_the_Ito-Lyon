@@ -6,6 +6,7 @@ from .config import (
     LogNCDEConfig,
     NRDEConfig,
     MNRDEConfig,
+    GRUConfig,
     SDEONetConfig,
     load_toml_config,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "LogNCDEConfig",
     "NRDEConfig",
     "MNRDEConfig",
+    "GRUConfig",
     "SDEONetConfig",
     "load_toml_config",
 ]

@@ -356,6 +356,82 @@ class _MLPPath(diffrax.AbstractPath):
             return self.evaluate(t1) - self.evaluate(t0)
 
 
+class SO3SGScheme(eqx.Module):
+    """SO(3) Savitzky-Golay scheme for rotation matrix data.
+
+    Uses manifold-aware polynomial fitting in the tangent space (Lie algebra).
+    Ensures outputs remain on SO(3) through exponential map and orthogonalization.
+
+    Handles flattened (T, 9) driver data from SO(3) datasets, which is the standard
+    format used by the SO3DynamicsSim dataloader.
+    """
+
+    poly_order: int = eqx.field(static=True)
+    weights: jax.Array | None = None
+
+    def __init__(
+        self,
+        poly_order: int = 3,
+        num_points: int | None = None,
+        *,
+        key: jax.Array | None = None,
+    ):
+        self.poly_order = poly_order
+        # Optional: learn weights (like WeightedSGScheme)
+        if num_points is not None and key is not None:
+            self.weights = jax.random.normal(key, (num_points,)) * 0.1
+        else:
+            self.weights = None
+
+    def create_control(
+        self,
+        t_all: jax.Array,
+        x_all: jax.Array,
+        n_recon: int,
+    ) -> tuple[diffrax.AbstractPath, jax.Array]:
+        from taming_the_ito_lyon.utils.savitzky_golay_so3 import SO3PolynomialPath
+        
+        if t_all.shape[0] < n_recon:
+            raise ValueError(f"t_all must have length >= n_recon")
+        
+        # Use FULL time array for polynomial, not just reconstruction
+        # The polynomial will fit on first n_recon points but cover full range
+        x_recon = x_all[:n_recon]
+        t_recon = t_all[:n_recon]
+        
+        # Reshape to (n_recon, 3, 3)
+        if x_recon.ndim == 2 and x_recon.shape[-1] == 9:
+            x_recon = x_recon.reshape(x_recon.shape[0], 3, 3)
+        
+        # Add batch dimension
+        R = x_recon[None, ...]  # (1, n_recon, 3, 3)
+        
+        # Process weights - must be batched!
+        weights = None
+        if self.weights is not None:
+            if self.weights.shape[0] != n_recon:
+                weights_1d = jnp.interp(
+                    jnp.linspace(0, 1, n_recon),
+                    jnp.linspace(0, 1, self.weights.shape[0]),
+                    jax.nn.softplus(self.weights),
+                )
+            else:
+                weights_1d = jax.nn.softplus(self.weights)
+            # Broadcast to batch dimension
+            weights = weights_1d[None, :]  # (1, n_recon)
+        
+        # Create path with FULL time range for extrapolation
+        # The key: pass t_all (not t_recon) so path covers full range
+        control = SO3PolynomialPath(
+            R=R,
+            t=t_recon,  # CHANGED: Full time array
+            p=self.poly_order,
+            weight=weights,  # Now (1, n_recon) or None
+        )
+        
+        return control, t_all
+
+
 def create_scheme(
     name: ExtrapolationSchemeType,
     *,
@@ -384,6 +460,7 @@ def create_scheme(
         - 'linear': Linear continuation from last segment
         - 'hermite': Polynomial from last cubic segment (can be unstable)
         - 'sg': Smooth polynomial extrapolation (fitted to all recon data)
+        - 'so3_sg': SO(3) manifold-aware SG for rotation data (flattened as 9D)
         - 'mlp': Learned extrapolation (MLP outputs for any time)
     """
     match name:
@@ -397,6 +474,8 @@ def create_scheme(
             return WeightedSGScheme(
                 num_points=num_points, poly_order=poly_order, key=key
             )
+        case "so3_sg":
+            return SO3SGScheme(poly_order=poly_order, num_points=num_points, key=key)
         case "mlp":
             if input_dim is None or key is None:
                 raise ValueError("'mlp' scheme requires input_dim and key")
@@ -409,5 +488,5 @@ def create_scheme(
             )
         case _:
             raise ValueError(
-                f"Unknown scheme: {name}. Use 'linear', 'hermite', 'sg', or 'mlp'"
+                f"Unknown scheme: {name}. Use 'linear', 'hermite', 'sg', 'so3_sg', or 'mlp'"
             )

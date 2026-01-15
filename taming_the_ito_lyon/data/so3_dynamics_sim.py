@@ -47,7 +47,7 @@ class SO3DynamicsSim(DatasetProtocol):
         )
         batch_size, timesteps, boxes, _, _ = rotmats.shape
         # (Batch * 4, Timesteps, 9)
-        rotmats_flat = rotmats.reshape(batch_size * boxes, timesteps, 9)
+        rotmats_flat = rotmats.transpose(0, 2, 1, 3, 4).reshape(batch_size * boxes, timesteps, 9)
         # Downsample first, then build 20-step windows on the downsampled sequence.
         # This makes each window correspond to indices:
         #   start : start + skip*20 : skip

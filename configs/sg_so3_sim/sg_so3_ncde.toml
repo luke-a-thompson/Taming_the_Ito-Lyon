@@ -3,7 +3,7 @@ model_type = "ncde"
 dataset_name = "sg_so3_simulation"
 
 # Extrapolation settings
-extrapolation_scheme = "hermite"
+extrapolation_scheme = "so3_sg"
 n_recon = 12
 
 # Optimizer
@@ -15,8 +15,8 @@ max_grad_norm = 1.0
 # Training
 loss = "frobenius"
 seed = 1
-batch_size = 512
-epochs = 200
+batch_size = 2048
+epochs = 100
 
 # Training mode
 training_mode = "conditional"
@@ -44,3 +44,8 @@ vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
 out_size = 6
+
+# Solver tolerances
+rtol = 1e-3
+atol = 1e-5
+dtmin = 1e-6

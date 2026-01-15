@@ -1,14 +1,20 @@
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from taming_the_ito_lyon.utils.mpl_style import apply_mpl_style
+from taming_the_ito_lyon.training.results_plotting import (
+    save_rough_volatility_two_panel_plot,
+    save_sg_so3_sphere_plot,
+)
 import jax
-import jax.numpy as jnp
 import numpy as np
 from scipy.stats import ks_2samp
 import os
 from dataclasses import dataclass
 from typing import Protocol
+
+
+apply_mpl_style()
 
 
 @dataclass
@@ -46,20 +52,15 @@ def get_rough_volatility_results(
     n_plot0 = 8 if n_plot is None else int(n_plot)
     n_plot0 = min(n_plot0, int(targets0_flat.shape[0]))
     if epoch_idx % 10 == 0:
-        fig, (ax_targets, ax_preds) = plt.subplots(
-            1, 2, figsize=(10, 4), sharex=True, sharey=True
-        )
-        for i in range(n_plot0):
-            ax_targets.plot(targets0_flat[i, :, 0], color="black", alpha=0.5)
-            ax_preds.plot(preds0_flat[i, :, 0], color="red", alpha=0.5)
-        ax_targets.set_title("Targets (one batch)")
-        ax_preds.set_title("Preds (one batch)")
-        fig.tight_layout()
         os.makedirs("z_paper_content/rough_volatility_samples_by_epoch", exist_ok=True)
-        fig.savefig(
-            f"z_paper_content/rough_volatility_samples_by_epoch/batch_plot_{epoch_idx}.png"
+        save_rough_volatility_two_panel_plot(
+            left=targets0_flat,
+            right=preds0_flat,
+            out_file=f"z_paper_content/rough_volatility_samples_by_epoch/batch_plot_{epoch_idx}.png",
+            n_plot=n_plot0,
+            left_title="Targets (one batch)",
+            right_title="Preds (one batch)",
         )
-        plt.close(fig)
 
     preds_all = np.concatenate(
         [np.array(jax.device_get(p)) for p in preds_batches], axis=0
@@ -88,95 +89,41 @@ def get_sg_so3_simulation_results(
     preds: list[jax.Array] | jax.Array,
     targets: list[jax.Array] | jax.Array,
     epoch_idx: int,
-    times_to_save: list[int] = [0, 21, 43, 64],
+    times_to_save: list[int] | None = None,
     n_plot: int | None = None,
 ) -> ResultsDict:
-    # We receive rotation matrices shaped (B, T, 3, 3) (or a single trajectory (T, 3, 3)).
-    # preds0 = preds[0] if isinstance(preds, list) else preds
-    # targets0 = targets[0] if isinstance(targets, list) else targets
+    """Visualize SO(3) predictions on a sphere.
 
-    # preds_np = np.array(jax.device_get(preds0))
-    # targets_np = np.array(jax.device_get(targets0))
+    Args:
+        preds: Predicted rotation matrices (B, T, 3, 3) (or list of batches)
+        targets: Target rotation matrices (B, T, 3, 3) (or list of batches)
+        epoch_idx: Current epoch number
+        times_to_save: Unused (for compatibility)
+        n_plot: Number of trajectories to plot (default: 1)
 
-    # jax.debug.print(f"targets_np.shape: {targets_np.shape}")
+    Returns:
+        Empty ResultsDict (plots saved to disk)
+    """
+    # We only ever plot one batch. If a list is passed, take the first batch.
+    preds0 = preds[0] if isinstance(preds, list) else preds
+    targets0 = targets[0] if isinstance(targets, list) else targets
 
-    # targets = targets0 if targets0.ndim == 3 else targets0[0]
-    # dR = jnp.einsum(
-    #     "tij,tkj->tik", targets[:-1].transpose(0, 2, 1), targets[1:]
-    # )  # R_t^T R_{t+1}
-    # cos = (jnp.trace(dR, axis1=-2, axis2=-1) - 1.0) / 2.0
-    # ang = jnp.arccos(jnp.clip(cos, -1.0, 1.0))
-    # jax.debug.print(f"ang: {ang}")  # (19,)
-    # jax.debug.print(f"ang.mean(): {ang.mean()}")
+    # Convert to numpy for plotting
+    preds_np = np.array(jax.device_get(preds0))
+    targets_np = np.array(jax.device_get(targets0))
 
-    # if preds_np.ndim == 3 and preds_np.shape[-2:] == (3, 3):
-    #     preds_np = preds_np[None, ...]
-    # if targets_np.ndim == 3 and targets_np.shape[-2:] == (3, 3):
-    #     targets_np = targets_np[None, ...]
+    if epoch_idx % 10 == 0:
+        # Create output directory
+        out_dir = os.environ.get(
+            "SG_SO3_SPHERE_PLOT_DIR", "z_paper_content/sg_so3_sphere_by_epoch"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        save_sg_so3_sphere_plot(
+            preds=preds_np,
+            targets=targets_np,
+            out_file=os.path.join(out_dir, f"sphere_epoch_{epoch_idx:05d}.png"),
+            n_plot=int(n_plot or 1),
+        )
 
-    # if preds_np.ndim != 4 or preds_np.shape[-2:] != (3, 3):
-    #     raise ValueError(f"Expected preds shaped (B, T, 3, 3), got {preds_np.shape}")
-    # if targets_np.ndim != 4 or targets_np.shape[-2:] != (3, 3):
-    #     raise ValueError(
-    #         f"Expected targets shaped (B, T, 3, 3), got {targets_np.shape}"
-    #     )
-
-    # # Project onto the sphere via R_t ẑ.
-    # ez = np.array([0.0, 0.0, 1.0], dtype=preds_np.dtype)
-    # preds_pts = preds_np @ ez  # (B, T, 3)
-    # targets_pts = targets_np @ ez  # (B, T, 3)
-
-    # # Plot only a couple of matched trajectories (same indices in preds/targets) so
-    # # the figure stays readable even for large batches.
-    # n_plot0 = 1
-    # out_dir = os.environ.get(
-    #     "SG_SO3_SPHERE_PLOT_DIR", "z_paper_content/sg_so3_sphere_by_epoch"
-    # )
-    # os.makedirs(out_dir, exist_ok=True)
-
-    # fig = plt.figure(figsize=(10, 5))
-    # ax_t = fig.add_subplot(1, 2, 1, projection="3d")
-    # ax_p = fig.add_subplot(1, 2, 2, projection="3d")
-
-    # # Sphere surface for context.
-    # u = np.linspace(0.0, 2.0 * np.pi, 40)
-    # v = np.linspace(0.0, np.pi, 20)
-    # xs = np.outer(np.cos(u), np.sin(v))
-    # ys = np.outer(np.sin(u), np.sin(v))
-    # zs = np.outer(np.ones_like(u), np.cos(v))
-    # ax_t.plot_surface(xs, ys, zs, color="lightgray", alpha=0.12, linewidth=0)
-    # ax_p.plot_surface(xs, ys, zs, color="lightgray", alpha=0.12, linewidth=0)
-
-    # for ax in (ax_t, ax_p):
-    #     ax.set_xlim(-1.05, 1.05)
-    #     ax.set_ylim(-1.05, 1.05)
-    #     ax.set_zlim(-1.05, 1.05)
-    #     ax.set_box_aspect((1.0, 1.0, 1.0))
-
-    # ax_t.set_title("Targets: $R_t\\hat{z}$ on $S^2$")
-    # ax_p.set_title("Preds: $R_t\\hat{z}$ on $S^2$")
-
-    # for i in range(n_plot0):
-    #     ax_t.plot(
-    #         targets_pts[i + 10, :, 0],
-    #         targets_pts[i + 10, :, 1],
-    #         targets_pts[i + 10, :, 2],
-    #         color="black",
-    #         alpha=0.55,
-    #         linewidth=1.2,
-    #     )
-    #     ax_p.plot(
-    #         preds_pts[i + 10, :, 0],
-    #         preds_pts[i + 10, :, 1],
-    #         preds_pts[i + 10, :, 2],
-    #         color="red",
-    #         alpha=0.55,
-    #         linewidth=1.2,
-    #     )
-
-    # fig.tight_layout()
-    # fig.savefig(os.path.join(str(out_dir), f"sphere_epoch_{int(epoch_idx):05d}.png"))
-    # plt.close(fig)
-
-    # Use validation loss for early stopping/selection in `experiment.py`.
+    # Return empty results (visualization only)
     return ResultsDict(eval_metric=None, results_times=[], results=[])

@@ -2,6 +2,7 @@ from __future__ import annotations
 import tomllib
 from pydantic import (
     BaseModel,
+    AliasChoices,
     ConfigDict,
     Field,
     PositiveInt,
@@ -18,6 +19,8 @@ from taming_the_ito_lyon.config.config_options import (
     HopfAlgebraType,
     TrainingMode,
     UnconditionalDriverKind,
+    ManifoldType,
+    StepsizeControllerType,
 )
 
 
@@ -83,10 +86,11 @@ class ExperimentConfig(BaseModel):
                 ModelType.NCDE,
                 ModelType.LOG_NCDE,
                 ModelType.MNRDE,
+                ModelType.GRU,
             ):
                 raise ValueError(
                     "extrapolation_scheme is only supported for model_type in "
-                    "{ncde, log_ncde, mnrde}."
+                    "{ncde, log_ncde, mnrde, gru}."
                 )
         return self
 
@@ -112,16 +116,6 @@ class ExperimentConfig(BaseModel):
         default=25, description="Epochs with no val improvement before stopping"
     )
 
-    # Performance / logging
-    tqdm_update_interval: PositiveInt = Field(
-        default=10,
-        description=(
-            "Update tqdm postfix every N steps. Note: updating postfix typically "
-            "requires syncing JAX device arrays to host, so larger values improve "
-            "training throughput."
-        ),
-    )
-
     @model_validator(mode="after")
     def validate_early_stopping_patience(self) -> ExperimentConfig:
         if self.early_stopping_patience > self.epochs:
@@ -130,6 +124,13 @@ class ExperimentConfig(BaseModel):
                 f"(got patience={self.early_stopping_patience}, epochs={self.epochs})"
             )
         return self
+
+    manifold: ManifoldType = Field(description="Manifold to use")
+    hidden_manifold: ManifoldType = Field(
+        default=ManifoldType.EUCLIDEAN, description="Hidden manifold to use"
+    )
+
+    evolving_out: bool = Field(description="Whether to evolve the output")
 
     # Training mode (conditional vs unconditional generator)
     training_mode: TrainingMode = Field(
@@ -148,6 +149,16 @@ class ExperimentConfig(BaseModel):
         default=None,
         le=1.0,
         description="Hurst parameter used when unconditional_driver_kind is 'rl'.",
+    )
+
+    # Performance / logging
+    tqdm_update_interval: PositiveInt = Field(
+        default=10,
+        description=(
+            "Update tqdm postfix every N steps. Note: updating postfix typically "
+            "requires syncing JAX device arrays to host, so larger values improve "
+            "training throughput."
+        ),
     )
 
     @model_validator(mode="after")
@@ -215,6 +226,29 @@ class ExperimentConfig(BaseModel):
         return self
 
 
+class SolverConfig(BaseModel):
+    """Solver configuration."""
+
+    stepsize_controller: StepsizeControllerType = Field(
+        description="Stepsize controller to use"
+    )
+
+    # Solver tolerances
+    rtol: PositiveFloat = Field(description="Relative tolerance for solver")
+    atol: PositiveFloat = Field(description="Absolute tolerance for solver")
+    dtmin: PositiveFloat = Field(description="Minimum time step for solver")
+
+    @model_validator(mode="after")
+    def validate_solver_tolerances(self) -> SolverConfig:
+        if not (0.0 < float(self.rtol) < 1.0):
+            raise ValueError(f"rtol must be in (0, 1), got {self.rtol}")
+        if not (0.0 < float(self.atol) < 1.0):
+            raise ValueError(f"atol must be in (0, 1), got {self.atol}")
+        if not (0.0 < float(self.dtmin) <= 1.0):
+            raise ValueError(f"dtmin must be in (0, 1], got {self.dtmin}")
+        return self
+
+
 class NCDEConfig(BaseModel):
     """Top-level NCDE configuration composed of model params."""
 
@@ -233,21 +267,6 @@ class NCDEConfig(BaseModel):
     )
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
-
-    # Solver tolerances
-    rtol: PositiveFloat = Field(description="Relative tolerance for solver")
-    atol: PositiveFloat = Field(description="Absolute tolerance for solver")
-    dtmin: PositiveFloat = Field(description="Minimum time step for solver")
-
-    @model_validator(mode="after")
-    def validate_solver_tolerances(self) -> NCDEConfig:
-        if not (0.0 < float(self.rtol) < 1.0):
-            raise ValueError(f"rtol must be in (0, 1), got {self.rtol}")
-        if not (0.0 < float(self.atol) < 1.0):
-            raise ValueError(f"atol must be in (0, 1), got {self.atol}")
-        if not (0.0 < float(self.dtmin) <= 1.0):
-            raise ValueError(f"dtmin must be in (0, 1], got {self.dtmin}")
-        return self
 
 
 class NRDEConfig(BaseModel):
@@ -335,6 +354,23 @@ class LogNCDEConfig(BaseModel):
     )
 
 
+class GRUConfig(BaseModel):
+    """Top-level GRU configuration composed of model params."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Model params
+    gru_state_dim: PositiveInt = Field(description="GRU hidden state dimension")
+    init_hidden_dim: PositiveInt = Field(
+        description="Initial condition MLP width (controls hidden layer width)",
+        validation_alias=AliasChoices("init_hidden_dim", "mlp_hidden_dim"),
+    )
+    initial_cond_mlp_depth: PositiveInt = Field(
+        description="Initial condition MLP depth (number of hidden layers)"
+    )
+    out_size: PositiveInt = Field(description="Output channels predicted by readout")
+
+
 class SDEONetConfig(BaseModel):
     """Top-level SDEONet configuration composed of model params."""
 
@@ -379,10 +415,12 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     experiment_config: ExperimentConfig
+    solver_config: SolverConfig
     ncde_config: NCDEConfig | None = None
     log_ncde_config: LogNCDEConfig | None = None
     nrde_config: NRDEConfig | None = None
     mnrde_config: MNRDEConfig | None = None
+    gru_config: GRUConfig | None = None
     sdeonet_config: SDEONetConfig | None = None
 
     @model_validator(mode="after")
@@ -395,6 +433,7 @@ class Config(BaseModel):
             ModelType.LOG_NCDE: self.log_ncde_config,
             ModelType.NRDE: self.nrde_config,
             ModelType.MNRDE: self.mnrde_config,
+            ModelType.GRU: self.gru_config,
             ModelType.SDEONET: self.sdeonet_config,
         }
 
@@ -410,6 +449,7 @@ class Config(BaseModel):
             self.log_ncde_config,
             self.nrde_config,
             self.mnrde_config,
+            self.gru_config,
             self.sdeonet_config,
         ]
         num_provided = sum(c is not None for c in all_configs)
@@ -421,7 +461,14 @@ class Config(BaseModel):
     @property
     def nn_config(
         self,
-    ) -> NCDEConfig | LogNCDEConfig | NRDEConfig | MNRDEConfig | SDEONetConfig:
+    ) -> (
+        NCDEConfig
+        | LogNCDEConfig
+        | NRDEConfig
+        | MNRDEConfig
+        | GRUConfig
+        | SDEONetConfig
+    ):
         """Get the active model configuration based on model_type."""
         model_type = self.experiment_config.model_type
 
@@ -437,6 +484,9 @@ class Config(BaseModel):
         elif model_type == ModelType.MNRDE:
             assert self.mnrde_config is not None
             return self.mnrde_config
+        elif model_type == ModelType.GRU:
+            assert self.gru_config is not None
+            return self.gru_config
         elif model_type == ModelType.SDEONET:
             assert self.sdeonet_config is not None
             return self.sdeonet_config

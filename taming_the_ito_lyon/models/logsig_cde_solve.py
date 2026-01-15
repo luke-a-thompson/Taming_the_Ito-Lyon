@@ -48,6 +48,7 @@ def solve_cde_from_windowed_logsigs(
     term = diffrax.ControlTerm(cde_func, logsig_control).to_ode()
     saveat = diffrax.SaveAt(ts=ts)
 
+    # This will evaluate the vector field many times over the course of the solve.
     solution = diffrax.diffeqsolve(
         terms=term,
         solver=solver,

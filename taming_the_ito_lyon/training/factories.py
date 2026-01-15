@@ -7,16 +7,22 @@ from taming_the_ito_lyon.config import (
     LogNCDEConfig,
     NRDEConfig,
     MNRDEConfig,
+    GRUConfig,
 )
 from taming_the_ito_lyon.config.config_options import (
     LossType,
     UnconditionalDriverKind,
+    StepsizeControllerType,
+    ManifoldType,
 )
+from stochastax.manifolds import Manifold, EuclideanSpace, SO3
+from diffrax import ConstantStepSize, PIDController
 from taming_the_ito_lyon.models import (
     NeuralCDE,
     LogNCDE,
     NeuralRDE,
     MNDRE,
+    GRU,
     create_scheme,
     Model,
 )
@@ -45,7 +51,9 @@ def _maybe_create_extrapolation_scheme(
         return key, None
 
     # Only these models currently accept extrapolation parameters.
-    if not isinstance(config.nn_config, (NCDEConfig, LogNCDEConfig, MNRDEConfig)):
+    if not isinstance(
+        config.nn_config, (NCDEConfig, LogNCDEConfig, MNRDEConfig, GRUConfig)
+    ):
         return key, None
 
     scheme_enum = config.experiment_config.extrapolation_scheme
@@ -63,16 +71,54 @@ def _maybe_create_extrapolation_scheme(
     return model_key, extrapolation_scheme
 
 
+def create_manifold_from_type(
+    manifold_type: ManifoldType,
+) -> type[Manifold]:
+    match manifold_type:
+        case ManifoldType.EUCLIDEAN:
+            return EuclideanSpace
+        case ManifoldType.SO3:
+            return SO3
+        case ManifoldType.SPD:
+            raise NotImplementedError("SPD manifold not implemented yet")
+        case _:
+            raise ValueError(f"Unknown manifold: {manifold_type}")
+
+
+def create_stepsize_controller(
+    config: Config,
+) -> ConstantStepSize | PIDController:
+    match config.solver_config.stepsize_controller:
+        case StepsizeControllerType.PID:
+            return PIDController(
+                rtol=config.solver_config.rtol,
+                atol=config.solver_config.atol,
+                dtmin=config.solver_config.dtmin,
+            )
+        case StepsizeControllerType.ADAPTIVE:
+            return ConstantStepSize()
+        case _:
+            raise ValueError(
+                f"Unknown stepsize controller: {config.solver_config.stepsize_controller}"
+            )
+
+
 def create_model(
     config: Config,
     *,
     input_path_dim: int,
     output_path_dim: int,
     key: jax.Array,
-) -> NeuralCDE | LogNCDE | NeuralRDE | MNDRE:
+) -> Model:
     model_key, extrapolation_scheme = _maybe_create_extrapolation_scheme(
         config, input_path_dim=input_path_dim, key=key
     )
+
+    manifold = create_manifold_from_type(config.experiment_config.manifold)
+    hidden_manifold = create_manifold_from_type(
+        config.experiment_config.hidden_manifold
+    )
+    stepsize_controller = create_stepsize_controller(config)
     match config.nn_config:
         case NCDEConfig():
             return NeuralCDE(
@@ -84,9 +130,9 @@ def create_model(
                 cde_state_dim=config.nn_config.cde_state_dim,
                 output_path_dim=output_path_dim,
                 key=model_key,
-                rtol=config.nn_config.rtol,
-                atol=config.nn_config.atol,
-                dtmin=config.nn_config.dtmin,
+                manifold=manifold,
+                stepsize_controller=stepsize_controller,
+                evolving_out=config.experiment_config.evolving_out,
                 extrapolation_scheme=extrapolation_scheme,
                 n_recon=config.experiment_config.n_recon,
             )
@@ -101,6 +147,7 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
+                stepsize_controller=stepsize_controller,
                 extrapolation_scheme=extrapolation_scheme,
                 n_recon=config.experiment_config.n_recon,
                 key=model_key,
@@ -116,6 +163,7 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
+                stepsize_controller=stepsize_controller,
                 key=key,
             )
         case MNRDEConfig():
@@ -129,10 +177,29 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
+                data_manifold=manifold,
+                hidden_manifold=hidden_manifold,
                 hopf_algebra_type=config.nn_config.hopf_algebra,
+                stepsize_controller=stepsize_controller,
                 extrapolation_scheme=extrapolation_scheme,
                 n_recon=config.experiment_config.n_recon,
                 key=model_key,
+            )
+        case GRUConfig():
+            # GRU expects a manifold *instance*, while the CDE/RDE models use the
+            # manifold type directly (class methods). We instantiate it here.
+            return GRU(
+                input_path_dim=input_path_dim,
+                gru_state_dim=config.nn_config.gru_state_dim,
+                output_path_dim=output_path_dim,
+                mlp_hidden_dim=config.nn_config.init_hidden_dim,
+                initial_cond_mlp_depth=config.nn_config.initial_cond_mlp_depth,
+                key=model_key,
+                manifold=manifold(),
+                hidden_manifold=hidden_manifold(),
+                evolving_out=config.experiment_config.evolving_out,
+                extrapolation_scheme=extrapolation_scheme,
+                n_recon=config.experiment_config.n_recon,
             )
         # case SDEONetConfig():
         #     return SDEONet(
@@ -331,8 +398,8 @@ def create_unconditional_control_sampler_batched(
 
 
 def create_grad_batch_loss_fns(
+    config: Config,
     *,
-    loss_type: LossType,
     output_path_dim: int | None = None,
 ) -> tuple[
     Callable[[Model, jax.Array, jax.Array], tuple[jax.Array, optax.Updates]],
@@ -353,13 +420,13 @@ def create_grad_batch_loss_fns(
         frobenius_loss,
     )
 
-    match loss_type:
+    match config.experiment_config.loss:
         case LossType.MSE:
             loss_fn = mse_loss
         case LossType.RGE:
-            loss_fn = rotational_geodesic_loss
+            loss_fn = rotational_geodesic_loss(config)
         case LossType.FROBENIUS:
-            loss_fn = frobenius_loss
+            loss_fn = frobenius_loss(config)
         case LossType.SIGKER:
             if output_path_dim is None:
                 raise ValueError(
@@ -379,7 +446,7 @@ def create_grad_batch_loss_fns(
                 prepend_zero_basepoint=True,
             )
         case _:
-            raise ValueError(f"Unknown loss type: {loss_type}")
+            raise ValueError(f"Unknown loss type: {config.experiment_config.loss}")
 
     def batch_loss_fn(
         model: Model,
