@@ -26,7 +26,6 @@ class ModelType(StrEnum):
     NRDE = "nrde"
     MNRDE = "mnrde"
     GRU = "gru"
-    SDEONET = "sdeonet"
 
 
 class Optimizer(StrEnum):
@@ -40,9 +39,11 @@ class HopfAlgebraType(StrEnum):
     GL = "gl"
     MKW = "mkw"
 
+
 class StepsizeControllerType(StrEnum):
     PID = "pid"
     ADAPTIVE = "adaptive"
+
 
 class ManifoldType(StrEnum):
     EUCLIDEAN = "euclidean"

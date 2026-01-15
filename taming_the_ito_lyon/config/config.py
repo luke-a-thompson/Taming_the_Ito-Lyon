@@ -371,46 +371,6 @@ class GRUConfig(BaseModel):
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
 
 
-class SDEONetConfig(BaseModel):
-    """Top-level SDEONet configuration composed of model params."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    # Model params
-    basis_in_dim: PositiveInt = Field(description="Number of Haar basis functions J")
-    basis_out_dim: PositiveInt = Field(description="Low-rank/trunk output dimension R")
-    T: PositiveFloat = Field(description="Time horizon")
-    hermite_M: PositiveInt = Field(description="Max Hermite order M")
-    wick_order: PositiveInt = Field(le=2, description="Wick order (1 or 2)")
-
-    # Time positional encoding
-    use_posenc: bool = Field(description="Use positional encoding for trunk input")
-    pe_dim: PositiveInt = Field(description="Positional encoding dimension (even)")
-    include_raw_time: bool = Field(description="Concatenate raw tau to PE features")
-
-    # Branch MLP
-    branch_width: PositiveInt = Field(description="Branch MLP width")
-    branch_depth: PositiveInt = Field(description="Branch MLP depth")
-
-    # Trunk MLP
-    trunk_width: PositiveInt = Field(description="Trunk MLP width")
-    trunk_depth: PositiveInt = Field(description="Trunk MLP depth")
-
-    # Normalization/skip
-    use_layernorm: bool = Field(description="Use LayerNorm in MLPs")
-    residual: bool = Field(description="Use residual connections in MLPs")
-
-    @model_validator(mode="after")
-    def validate_architecture(self) -> SDEONetConfig:
-        if int(self.wick_order) not in (1, 2):
-            raise ValueError(f"wick_order must be 1 or 2, got {self.wick_order}")
-        if self.use_posenc and int(self.pe_dim) % 2 != 0:
-            raise ValueError(
-                f"pe_dim must be even when use_posenc=True, got {self.pe_dim}"
-            )
-        return self
-
-
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -421,7 +381,6 @@ class Config(BaseModel):
     nrde_config: NRDEConfig | None = None
     mnrde_config: MNRDEConfig | None = None
     gru_config: GRUConfig | None = None
-    sdeonet_config: SDEONetConfig | None = None
 
     @model_validator(mode="after")
     def validate_model_config_exists(self) -> "Config":
@@ -434,7 +393,6 @@ class Config(BaseModel):
             ModelType.NRDE: self.nrde_config,
             ModelType.MNRDE: self.mnrde_config,
             ModelType.GRU: self.gru_config,
-            ModelType.SDEONET: self.sdeonet_config,
         }
 
         active_config = config_map.get(model_type)
@@ -450,7 +408,6 @@ class Config(BaseModel):
             self.nrde_config,
             self.mnrde_config,
             self.gru_config,
-            self.sdeonet_config,
         ]
         num_provided = sum(c is not None for c in all_configs)
         if num_provided > 1:
@@ -461,14 +418,7 @@ class Config(BaseModel):
     @property
     def nn_config(
         self,
-    ) -> (
-        NCDEConfig
-        | LogNCDEConfig
-        | NRDEConfig
-        | MNRDEConfig
-        | GRUConfig
-        | SDEONetConfig
-    ):
+    ) -> NCDEConfig | LogNCDEConfig | NRDEConfig | MNRDEConfig | GRUConfig:
         """Get the active model configuration based on model_type."""
         model_type = self.experiment_config.model_type
 
@@ -487,9 +437,6 @@ class Config(BaseModel):
         elif model_type == ModelType.GRU:
             assert self.gru_config is not None
             return self.gru_config
-        elif model_type == ModelType.SDEONET:
-            assert self.sdeonet_config is not None
-            return self.sdeonet_config
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 

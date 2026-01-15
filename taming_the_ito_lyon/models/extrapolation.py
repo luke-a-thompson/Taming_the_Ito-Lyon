@@ -390,22 +390,22 @@ class SO3SGScheme(eqx.Module):
         n_recon: int,
     ) -> tuple[diffrax.AbstractPath, jax.Array]:
         from taming_the_ito_lyon.utils.savitzky_golay_so3 import SO3PolynomialPath
-        
+
         if t_all.shape[0] < n_recon:
-            raise ValueError(f"t_all must have length >= n_recon")
-        
+            raise ValueError("t_all must have length >= n_recon")
+
         # Use FULL time array for polynomial, not just reconstruction
         # The polynomial will fit on first n_recon points but cover full range
         x_recon = x_all[:n_recon]
         t_recon = t_all[:n_recon]
-        
+
         # Reshape to (n_recon, 3, 3)
         if x_recon.ndim == 2 and x_recon.shape[-1] == 9:
             x_recon = x_recon.reshape(x_recon.shape[0], 3, 3)
-        
+
         # Add batch dimension
         R = x_recon[None, ...]  # (1, n_recon, 3, 3)
-        
+
         # Process weights - must be batched!
         weights = None
         if self.weights is not None:
@@ -419,7 +419,7 @@ class SO3SGScheme(eqx.Module):
                 weights_1d = jax.nn.softplus(self.weights)
             # Broadcast to batch dimension
             weights = weights_1d[None, :]  # (1, n_recon)
-        
+
         # Create path with FULL time range for extrapolation
         # The key: pass t_all (not t_recon) so path covers full range
         control = SO3PolynomialPath(
@@ -428,7 +428,7 @@ class SO3SGScheme(eqx.Module):
             p=self.poly_order,
             weight=weights,  # Now (1, n_recon) or None
         )
-        
+
         return control, t_all
 
 

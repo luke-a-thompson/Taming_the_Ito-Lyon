@@ -26,7 +26,9 @@ def create_dry_run_config(base_config_path: Path, epochs: int = 1) -> str:
     # Override to minimal training
     config["experiment_config"]["epochs"] = epochs
     config["experiment_config"]["batch_size"] = 8
-    config["experiment_config"]["early_stopping_patience"] = epochs + 1  # Don't early stop
+    config["experiment_config"]["early_stopping_patience"] = (
+        epochs + 1
+    )  # Don't early stop
 
     # Write as TOML
     lines = []
@@ -56,9 +58,7 @@ def test_training_dry_run(config_path: Path) -> None:
     # Create temporary config with 5 epochs
     dry_run_toml = create_dry_run_config(config_path, epochs=5)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".toml", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as tmp:
         tmp.write(dry_run_toml)
         tmp_path = tmp.name
 
