@@ -83,6 +83,7 @@ class NeuralCDE(eqx.Module):
     # Solver configuration
     solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
     stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
+    dt0: float | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -98,6 +99,7 @@ class NeuralCDE(eqx.Module):
         manifold: type[Manifold],
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
         stepsize_controller: diffrax.AbstractStepSizeController,
+        dt0: float | None = None,
         evolving_out: bool,
         readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         extrapolation_scheme: ExtrapolationScheme | None = None,
@@ -135,10 +137,12 @@ class NeuralCDE(eqx.Module):
         self.n_recon = n_recon
         self.evolving_out = evolving_out
         self.manifold = manifold
+        self.readout_activation = readout_activation
 
         # Solver configuration
         self.solver = solver
         self.stepsize_controller = stepsize_controller
+        self.dt0 = dt0
 
     def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
         """Apply readout to hidden states, converting from 6D to 3x3 rotation matrices."""
@@ -171,7 +175,7 @@ class NeuralCDE(eqx.Module):
             solver=self.solver,
             t0=ts[0],
             t1=ts[-1],
-            dt0=1,
+            dt0=self.dt0,
             y0=y0,
             stepsize_controller=self.stepsize_controller,
             saveat=saveat,
@@ -208,10 +212,8 @@ class NeuralCDE(eqx.Module):
 
             return outputs
         else:
-            # Standard mode: build interpolation from raw values.
-            # Prepend time channel to match extrapolation scheme format
-            ys_with_time = jnp.concatenate([ts[:, None], control_values], axis=1)
-            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=ys_with_time)
+            # Standard mode: build interpolation directly from raw values.
+            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=control_values)
             control = diffrax.CubicInterpolation(ts, coeffs)
             hidden = self._forward_with_control(ts, control)
 

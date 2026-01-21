@@ -1,25 +1,24 @@
 [experiment_config]
-model_type = "log_ncde"
+model_type = "mnrde"
 dataset_name = "rough_bergomi"
 
 # Optimizer
 optimizer = "adamw"
-learning_rate = 1e-4
+learning_rate = 3e-4
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
 loss = "sigker"
 seed = 1
-batch_size = 2048
-epochs = 200
+batch_size = 1024
+epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-# To run unconditional generation, switch training_mode and set:
-unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
+unconditional_driver_kind = "rl" # "bm" | "fbm" | "rl"
 unconditional_driver_dim = 1     # number of non-time channels
-unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
+unconditional_hurst = 0.33        # used for "fbm"/"rl"
 
 manifold = "euclidean"
 hidden_manifold = "euclidean"
@@ -31,16 +30,21 @@ rtol = 1e-3
 atol = 1e-3
 dtmin = 1e-4
 
-[log_ncde_config]
+[mnrde_config]
 
-# Log-NCDE model parameters
-cde_state_dim = 16         # Jacobian burden, quadratic in this
+# M-NRDE model parameters
+cde_state_dim = 32
 init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
-vf_mlp_depth = 3
+vf_mlp_depth = 2
 out_size = 1
 
 # Log-signature configuration
 signature_depth = 2
-signature_window_size = 4
+
+# Multi-window drive (all must divide T-1=512 for rough_bergomi in this repo)
+signature_window_sizes = [16, 64, 128]
+
+hopf_algebra = "gl"
+

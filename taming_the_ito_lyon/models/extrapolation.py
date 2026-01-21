@@ -266,16 +266,21 @@ class MLPScheme(eqx.Module):
     The MLP takes both time and a context vector (encoding of reconstruction data)
     to produce outputs. This allows it to adapt to individual sequences while
     still learning a general extrapolation function.
+
+    The context is produced by flattening the reconstruction segment into a
+    single vector and encoding it with an MLP.
     """
 
     encoder: eqx.nn.MLP
     decoder: eqx.nn.MLP
     input_dim: int = eqx.field(static=True)
     context_dim: int = eqx.field(static=True)
+    n_recon: int = eqx.field(static=True)
 
     def __init__(
         self,
         input_dim: int,
+        n_recon: int,
         context_dim: int = 16,
         hidden_dim: int = 32,
         depth: int = 2,
@@ -285,10 +290,11 @@ class MLPScheme(eqx.Module):
         k1, k2 = jax.random.split(key)
         self.input_dim = input_dim
         self.context_dim = context_dim
+        self.n_recon = n_recon
 
         # Encoder: maps reconstruction data to context vector
         self.encoder = eqx.nn.MLP(
-            in_size=input_dim,
+            in_size=input_dim * n_recon,
             out_size=context_dim,
             width_size=hidden_dim,
             depth=depth,
@@ -314,11 +320,14 @@ class MLPScheme(eqx.Module):
             raise ValueError(
                 f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
             )
+        if n_recon != self.n_recon:
+            raise ValueError(
+                f"n_recon mismatch: scheme was initialized with {self.n_recon}, got {n_recon}"
+            )
         x_recon = x_all[:n_recon]
 
-        # Encode reconstruction data into context (mean pooling)
-        contexts = jax.vmap(self.encoder)(x_recon)  # (n_recon, context_dim)
-        context = jnp.mean(contexts, axis=0)  # (context_dim,)
+        # Encode reconstruction data into context (flattened)
+        context = self.encoder(jnp.reshape(x_recon, (-1,)))  # (context_dim,)
 
         control = _MLPPath(
             decoder=self.decoder,
@@ -329,18 +338,117 @@ class MLPScheme(eqx.Module):
         return control, t_all
 
 
+class PiecewiseMLPScheme(eqx.Module):
+    """Piecewise MLP extrapolation: ground-truth recon, MLP for future.
+
+    - For reconstruction times (t <= t_recon[-1]): uses linear interpolation of the
+      observed reconstruction data.
+    - For future times (t > t_recon[-1]): uses a conditioned decoder MLP.
+
+    The decoder output is shifted by a constant vector to ensure continuity at the
+    split time t_recon[-1].
+    """
+
+    encoder: eqx.nn.MLP
+    decoder: eqx.nn.MLP
+    input_dim: int = eqx.field(static=True)
+    context_dim: int = eqx.field(static=True)
+    n_recon: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_recon: int,
+        context_dim: int = 16,
+        hidden_dim: int = 32,
+        depth: int = 2,
+        *,
+        key: jax.Array,
+    ) -> None:
+        k1, k2 = jax.random.split(key)
+        self.input_dim = input_dim
+        self.context_dim = context_dim
+        self.n_recon = n_recon
+
+        self.encoder = eqx.nn.MLP(
+            in_size=input_dim * n_recon,
+            out_size=context_dim,
+            width_size=hidden_dim,
+            depth=depth,
+            key=k1,
+        )
+        self.decoder = eqx.nn.MLP(
+            in_size=1 + context_dim,
+            out_size=input_dim,
+            width_size=hidden_dim,
+            depth=depth,
+            key=k2,
+        )
+
+    def create_control(
+        self,
+        t_all: jax.Array,
+        x_all: jax.Array,
+        n_recon: int,
+    ) -> tuple[diffrax.AbstractPath, jax.Array]:
+        if t_all.shape[0] < n_recon or x_all.shape[0] < n_recon:
+            raise ValueError(
+                f"t_all and x_all must have length >= n_recon, got {t_all.shape[0]} and {x_all.shape[0]}"
+            )
+        if n_recon != self.n_recon:
+            raise ValueError(
+                f"n_recon mismatch: scheme was initialized with {self.n_recon}, got {n_recon}"
+            )
+        t_recon = t_all[:n_recon]
+        x_recon = x_all[:n_recon]
+
+        context = self.encoder(jnp.reshape(x_recon, (-1,)))  # (context_dim,)
+
+        ys_with_time = jnp.concatenate([t_recon[:, None], x_recon], axis=1)
+        recon_control = diffrax.LinearInterpolation(ts=t_recon, ys=ys_with_time)
+
+        mlp_control = _MLPPath(
+            decoder=self.decoder,
+            context=context,
+            t0=t_all[0],
+            t1=t_all[-1],
+        )
+        t_recon_end = t_recon[-1]
+        x_recon_end = x_recon[-1]
+        x_mlp_end = mlp_control.evaluate(t_recon_end)[1:]
+        mlp_shift = x_recon_end - x_mlp_end
+
+        control = _PiecewiseReconMLPPath(
+            recon_control=recon_control,
+            decoder=self.decoder,
+            context=context,
+            t0=t_all[0],
+            t1=t_all[-1],
+            t_recon_end=t_recon_end,
+            mlp_shift=mlp_shift,
+        )
+        return control, t_all
+
+
 class _MLPPath(diffrax.AbstractPath):
     """Diffrax-compatible path backed by a conditioned MLP."""
 
     decoder: eqx.nn.MLP
     context: jax.Array
-    # t0 and t1 inherited from AbstractPath
+    t0: RealScalarLike  # type: ignore[assignment]
+    t1: RealScalarLike  # type: ignore[assignment]
 
-    def __init__(self, decoder: eqx.nn.MLP, context: jax.Array, t0: float, t1: float):
-        self.decoder = decoder
-        self.context = context
-        self.t0 = t0  # type: ignore[misc]
-        self.t1 = t1  # type: ignore[misc]
+    def __init__(
+        self,
+        decoder: eqx.nn.MLP,
+        context: jax.Array,
+        t0: RealScalarLike,
+        t1: RealScalarLike,
+    ) -> None:
+        object.__setattr__(self, "decoder", decoder)
+        object.__setattr__(self, "context", context)
+        object.__setattr__(self, "t0", t0)
+        object.__setattr__(self, "t1", t1)
 
     def evaluate(self, t0, t1=None, left=True):
         del left
@@ -354,6 +462,62 @@ class _MLPPath(diffrax.AbstractPath):
             return jnp.concatenate([jnp.array([t0]), x_t])
         else:
             return self.evaluate(t1) - self.evaluate(t0)
+
+
+class _PiecewiseReconMLPPath(diffrax.AbstractPath):
+    """Ground-truth recon control, MLP for future times.
+
+    Uses linear interpolation of the observed reconstruction data for
+    t <= t_recon_end. For later times, uses the conditioned decoder MLP and an
+    additive shift chosen to ensure continuity at t_recon_end.
+    """
+
+    recon_control: diffrax.LinearInterpolation
+    decoder: eqx.nn.MLP
+    context: jax.Array
+    t_recon_end: RealScalarLike
+    mlp_shift: jax.Array
+    t0: RealScalarLike  # type: ignore[assignment]
+    t1: RealScalarLike  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        recon_control: diffrax.LinearInterpolation,
+        decoder: eqx.nn.MLP,
+        context: jax.Array,
+        t0: RealScalarLike,
+        t1: RealScalarLike,
+        t_recon_end: RealScalarLike,
+        mlp_shift: jax.Array,
+    ) -> None:
+        object.__setattr__(self, "recon_control", recon_control)
+        object.__setattr__(self, "decoder", decoder)
+        object.__setattr__(self, "context", context)
+        object.__setattr__(self, "t0", t0)
+        object.__setattr__(self, "t1", t1)
+        object.__setattr__(self, "t_recon_end", t_recon_end)
+        object.__setattr__(self, "mlp_shift", mlp_shift)
+
+    def _eval_mlp(self, t: RealScalarLike) -> jax.Array:
+        # Normalize time to [0, 1] based on full range.
+        t_norm = (t - self.t0) / (self.t1 - self.t0 + 1e-8)
+        mlp_input = jnp.concatenate([jnp.atleast_1d(t_norm), self.context])
+        x_t = self.decoder(mlp_input) + self.mlp_shift
+        return jnp.concatenate([jnp.array([t]), x_t])
+
+    def evaluate(self, t0, t1=None, left=True):
+        del left
+        if t1 is None:
+            use_recon = t0 <= self.t_recon_end
+            return jax.lax.cond(
+                use_recon,
+                lambda _: self.recon_control.evaluate(t0),
+                lambda _: self._eval_mlp(t0),
+                operand=None,
+            )
+
+        # Diffrax convention: increments are differences of values.
+        return self.evaluate(t1) - self.evaluate(t0)
 
 
 class SO3SGScheme(eqx.Module):
@@ -427,6 +591,8 @@ class SO3SGScheme(eqx.Module):
             t=t_recon,  # CHANGED: Full time array
             p=self.poly_order,
             weight=weights,  # Now (1, n_recon) or None
+            t0=t_all[0],
+            t1=t_all[-1],
         )
 
         return control, t_all
@@ -447,7 +613,7 @@ def create_scheme(
     Args:
         name: One of ExtrapolationSchemeType
         input_dim: Required for 'mlp' scheme
-        num_points: Required for 'sg' scheme (reconstruction sequence length)
+        num_points: Required for 'sg' and 'mlp' schemes (reconstruction length)
         poly_order: Polynomial order for 'sg' scheme (default: 3)
         hidden_dim: Hidden dimension for 'mlp' scheme
         mlp_depth: Depth for 'mlp' scheme
@@ -462,6 +628,7 @@ def create_scheme(
         - 'sg': Smooth polynomial extrapolation (fitted to all recon data)
         - 'so3_sg': SO(3) manifold-aware SG for rotation data (flattened as 9D)
         - 'mlp': Learned extrapolation (MLP outputs for any time)
+        - 'piecewiseMLP': Ground-truth reconstruction + MLP future extrapolation
     """
     match name:
         case "linear":
@@ -477,16 +644,30 @@ def create_scheme(
         case "so3_sg":
             return SO3SGScheme(poly_order=poly_order, num_points=num_points, key=key)
         case "mlp":
-            if input_dim is None or key is None:
-                raise ValueError("'mlp' scheme requires input_dim and key")
+            if input_dim is None or key is None or num_points is None:
+                raise ValueError("'mlp' scheme requires input_dim, num_points, and key")
             return MLPScheme(
                 input_dim=input_dim,
+                n_recon=num_points,
                 context_dim=hidden_dim // 2,  # Use half hidden_dim for context
+                hidden_dim=hidden_dim,
+                depth=mlp_depth,
+                key=key,
+            )
+        case "piecewiseMLP":
+            if input_dim is None or key is None or num_points is None:
+                raise ValueError(
+                    "'piecewiseMLP' scheme requires input_dim, num_points, and key"
+                )
+            return PiecewiseMLPScheme(
+                input_dim=input_dim,
+                n_recon=num_points,
+                context_dim=hidden_dim // 2,
                 hidden_dim=hidden_dim,
                 depth=mlp_depth,
                 key=key,
             )
         case _:
             raise ValueError(
-                f"Unknown scheme: {name}. Use 'linear', 'hermite', 'sg', 'so3_sg', or 'mlp'"
+                f"Unknown scheme: {name}. Use 'linear', 'hermite', 'sg', 'so3_sg', 'mlp', or 'piecewiseMLP'"
             )

@@ -42,8 +42,7 @@ class HopfAlgebraType(StrEnum):
 
 class StepsizeControllerType(StrEnum):
     PID = "pid"
-    ADAPTIVE = "adaptive"
-
+    CONSTANT = "constant"
 
 class ManifoldType(StrEnum):
     EUCLIDEAN = "euclidean"
@@ -57,12 +56,14 @@ class ExtrapolationSchemeType(StrEnum):
     SG = "sg"
     SO3_SG = "so3_sg"
     MLP = "mlp"
+    PIECEWISE_MLP = "piecewiseMLP"
 
 
 class LossType(StrEnum):
     MSE = "mse"
     RGE = "rge"
     SIGKER = "sigker"
+    SIGKER_WEIGHTED = "sigker_weighted"
     FROBENIUS = "frobenius"
 
 

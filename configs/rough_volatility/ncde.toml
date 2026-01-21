@@ -12,7 +12,7 @@ max_grad_norm = 1.0
 loss = "sigker"
 seed = 1
 batch_size = 2048
-epochs = 200
+epochs = 100
 
 # Training mode
 training_mode = "unconditional"
@@ -20,6 +20,16 @@ training_mode = "unconditional"
 unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
 unconditional_driver_dim = 1     # number of non-time channels
 unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
+
+manifold = "euclidean"
+hidden_manifold = "euclidean"
+evolving_out = true
+
+[solver_config]
+stepsize_controller = "pid"
+rtol = 1e-2
+atol = 1e-3
+dtmin = 1e-4
 
 [ncde_config]
 
@@ -30,8 +40,3 @@ vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
 out_size = 1
-
-# Solver tolerances
-rtol = 0.001
-atol = 0.000001
-dtmin = 1e-6

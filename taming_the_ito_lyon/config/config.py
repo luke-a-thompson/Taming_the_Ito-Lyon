@@ -237,6 +237,7 @@ class SolverConfig(BaseModel):
     rtol: PositiveFloat = Field(description="Relative tolerance for solver")
     atol: PositiveFloat = Field(description="Absolute tolerance for solver")
     dtmin: PositiveFloat = Field(description="Minimum time step for solver")
+    dt0: PositiveFloat = Field(default=0.01, description="Initial step size for solver")
 
     @model_validator(mode="after")
     def validate_solver_tolerances(self) -> SolverConfig:
@@ -246,6 +247,8 @@ class SolverConfig(BaseModel):
             raise ValueError(f"atol must be in (0, 1), got {self.atol}")
         if not (0.0 < float(self.dtmin) <= 1.0):
             raise ValueError(f"dtmin must be in (0, 1], got {self.dtmin}")
+        if not (0.0 < float(self.dt0) <= 1.0):
+            raise ValueError(f"dt0 must be in (0, 1], got {self.dt0}")
         return self
 
 
@@ -320,6 +323,16 @@ class MNRDEConfig(BaseModel):
     signature_depth: PositiveInt = Field(le=5, description="Signature depth")
     signature_window_size: PositiveInt = Field(
         default=1, description="Data steps per log-signature window"
+    )
+
+    # Optional multi-window variant: compute log-signatures on multiple window sizes
+    # and drive a sum of CDE terms, one per window size.
+    signature_window_sizes: list[int] | None = Field(
+        default=None,
+        description=(
+            "Optional list of disjoint log-signature window sizes. If provided, "
+            "overrides signature_window_size and uses a multi-window MNRDE drive."
+        ),
     )
 
     # Hopf algebra for M-NRDE

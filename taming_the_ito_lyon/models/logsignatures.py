@@ -77,15 +77,30 @@ def compute_windowed_logsignatures_from_values(
 
     window_len = step + 1
 
-    pad_len = window_len - 1
-    if pad_len > 0:
-        pad_tail = jnp.repeat(values[-1][None, :], repeats=pad_len, axis=0)
-    else:
-        pad_tail = values[:0]
-    values_padded = jnp.concatenate([values, pad_tail], axis=0)
+    # For unconditional Brownian drivers we want an Itô branched lift when using
+    # branched Hopf algebras (GL/MKW). In that case we must provide the quadratic
+    # covariation increments. In this codebase, unconditional controls include a
+    # leading time channel, followed by Brownian channels.
+    #
+    # We assume the sampling grid is uniform (ts = linspace(0,1,T)), which is true
+    # throughout the training runtime.
+    dt = jnp.asarray(1.0 / float(int(values.shape[0]) - 1), dtype=values.dtype)
+
+    def _brownian_cov_increments(num_increments: int, dim: int) -> jax.Array:
+        # Covariance for increments of (t, W): [dt for W dims on the diagonal; 0 for t]
+        # Shape: (num_increments, dim, dim)
+        if dim < 2:
+            raise ValueError(
+                "Branched (Itô) signature requires at least 2 channels: time + Brownian."
+            )
+        diag = jnp.concatenate(
+            [jnp.zeros((1,), dtype=values.dtype), jnp.full((dim - 1,), dt)], axis=0
+        )
+        cov1 = jnp.diag(diag)  # (dim, dim)
+        return jnp.broadcast_to(cov1, (num_increments, dim, dim))
 
     def window_logsig(i: jax.Array) -> jax.Array:
-        seg = jax.lax.dynamic_slice_in_dim(values_padded, i, window_len, axis=0)
+        seg = jax.lax.dynamic_slice_in_dim(values, i, window_len, axis=0)
 
         match hopf_algebra:
             case ShuffleHopfAlgebra():
@@ -97,19 +112,27 @@ def compute_windowed_logsignatures_from_values(
                     "full",
                 )
             case GLHopfAlgebra():
+                cov_increments = _brownian_cov_increments(
+                    num_increments=window_len - 1, dim=int(seg.shape[-1])
+                )
                 sig = compute_nonplanar_branched_signature(
                     seg,
                     signature_depth,
                     hopf_algebra,
                     "full",
+                    cov_increments=cov_increments,
                 )
                 logsig = sig.log()
             case MKWHopfAlgebra():
+                cov_increments = _brownian_cov_increments(
+                    num_increments=window_len - 1, dim=int(seg.shape[-1])
+                )
                 sig = compute_planar_branched_signature(
                     seg,
                     signature_depth,
                     hopf_algebra,
                     "full",
+                    cov_increments=cov_increments,
                 )
                 logsig = sig.log()
             case _:
@@ -118,6 +141,13 @@ def compute_windowed_logsignatures_from_values(
         return logsig.flatten()
 
     num_points = int(values.shape[0])
-    num_windows = (num_points - 1 + step - 1) // step
-    indices = (jnp.arange(num_windows, dtype=jnp.int32) * step).astype(jnp.int32)
+    remainder = (num_points - 1) % step
+    if remainder != 0:
+        raise ValueError(
+            "Disjoint signature windows must cover the full series with no padding. "
+            f"Got num_points={num_points}, signature_window_size={step} "
+            f"(remainder={remainder})."
+        )
+
+    indices = jnp.arange(0, num_points - 1, step, dtype=jnp.int32)
     return jax.vmap(window_logsig)(indices)

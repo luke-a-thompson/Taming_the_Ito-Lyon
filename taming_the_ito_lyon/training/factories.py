@@ -62,10 +62,15 @@ def _maybe_create_extrapolation_scheme(
     assert n_recon is not None
 
     model_key, scheme_key = jax.random.split(key)
+    # In extrapolation mode the model consumes controls with a prepended time
+    # channel (dimension = input_channels + 1), but the extrapolation schemes are
+    # fit on the raw driver channels without time. In particular, the MLP-based
+    # schemes' encoder/decoder operate on value channels only.
+    scheme_input_dim = int(input_path_dim) - 1
     extrapolation_scheme = create_scheme(
         scheme_enum,
         num_points=n_recon,
-        input_dim=input_path_dim,
+        input_dim=scheme_input_dim,
         key=scheme_key,
     )
     return model_key, extrapolation_scheme
@@ -95,7 +100,7 @@ def create_stepsize_controller(
                 atol=config.solver_config.atol,
                 dtmin=config.solver_config.dtmin,
             )
-        case StepsizeControllerType.ADAPTIVE:
+        case StepsizeControllerType.CONSTANT:
             return ConstantStepSize()
         case _:
             raise ValueError(
@@ -177,6 +182,7 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
+                signature_window_sizes=config.nn_config.signature_window_sizes,
                 data_manifold=manifold,
                 hidden_manifold=hidden_manifold,
                 hopf_algebra_type=config.nn_config.hopf_algebra,
@@ -418,6 +424,7 @@ def create_grad_batch_loss_fns(
         rotational_geodesic_loss,
         truncated_sig_loss_time_augmented,
         frobenius_loss,
+        weighted_truncated_signature_score,
     )
 
     match config.experiment_config.loss:
@@ -445,6 +452,17 @@ def create_grad_batch_loss_fns(
                 anchor_at_start=False,
                 prepend_zero_basepoint=True,
             )
+        case LossType.SIGKER_WEIGHTED:
+            raise NotImplementedError("SIGKER_WEIGHTED loss not implemented yet")
+            # if output_path_dim is None:
+            #     raise ValueError(
+            #         "output_path_dim must be provided when loss_type is SIGKER so the "
+            #         "Hopf algebra can be constructed outside of jit."
+            #     )
+            # loss_fn = weighted_truncated_signature_score(
+            #     depth=4,
+            #     ambient_dim=int(output_path_dim),
+            # )
         case _:
             raise ValueError(f"Unknown loss type: {config.experiment_config.loss}")
 
@@ -463,6 +481,9 @@ def create_grad_batch_loss_fns(
 def configure_jax() -> None:
     """Configure global JAX settings (matmul precision and persistent compilation cache)."""
     import os
+    import lovely_jax
+
+    lovely_jax.monkey_patch()
 
     jax.config.update("jax_default_matmul_precision", "tensorfloat32")
     jax.config.update("jax_enable_compilation_cache", True)

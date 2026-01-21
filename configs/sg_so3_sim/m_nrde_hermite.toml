@@ -1,22 +1,23 @@
 [experiment_config]
-model_type = "ncde"
+model_type = "mnrde"
 dataset_name = "sg_so3_simulation"
 
 # Extrapolation settings
-extrapolation_scheme = "so3_sg"
+extrapolation_scheme = "hermite"
 n_recon = 12
 
 # Optimizer
 optimizer = "adamw"
-learning_rate = 1e-4
+learning_rate = 1e-3
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
 loss = "frobenius"
 seed = 1
-batch_size = 2048
-epochs = 100
+batch_size = 1024
+epochs = 15
+early_stopping_patience = 5
 
 # Training mode
 training_mode = "conditional"
@@ -35,9 +36,9 @@ rtol = 1e-2
 atol = 1e-3
 dtmin = 1e-4
 
-[ncde_config]
+[mnrde_config]
 
-# NCDE model parameters
+# M-NRDE model parameters
 cde_state_dim = 16
 init_hidden_dim = 32
 vf_hidden_dim = 32
@@ -45,7 +46,8 @@ initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
 out_size = 6
 
-# Solver tolerances
-rtol = 1e-3
-atol = 1e-5
-dtmin = 1e-6
+# Log-signature configuration
+signature_depth = 2
+signature_window_size = 4
+
+hopf_algebra = "shuffle"

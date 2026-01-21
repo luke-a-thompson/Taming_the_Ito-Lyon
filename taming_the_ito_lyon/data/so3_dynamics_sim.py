@@ -63,20 +63,31 @@ class SO3DynamicsSim(DatasetProtocol):
             input_sequence=rotmats_flat,
             target_sequence=rotmats_flat,
             split=self.split,
-            input_window_len=20,  # we will fit the polynomaial to 12 (n_recon) points only
-            target_window_len=20,
+            input_window_len=21,  # we will fit the polynomaial to 12 (n_recon) points only
+            target_window_len=21,
             train_fraction=train_fraction,
             val_fraction=val_fraction,
             sliding_window_stride=1,
         )
 
-        # `np.lib.stride_tricks.sliding_window_view` appends the window axis at the end,
-        # so for sequences shaped (B, T, C) the windowed result often comes out as
-        # (B, W, C, L). We want (B, W, L, C) for downstream code and batching.
-        if driver_np.ndim == 4 and int(driver_np.shape[-1]) == 20:
-            driver_np = np.swapaxes(driver_np, -1, -2)
-        if solution_np.ndim == 4 and int(solution_np.shape[-1]) == 20:
-            solution_np = np.swapaxes(solution_np, -1, -2)
+        # `np.lib.stride_tricks.sliding_window_view` appends the window axis at the end.
+        # For sequences shaped (B, T, C) this yields windows shaped (B, W, C, L).
+        # We want (B, W, L, C) for downstream code and batching.
+        #
+        # Historically this was hard-coded for L=20; instead, normalize by ensuring the
+        # channel axis (C=9) is last.
+        def _ensure_b_w_l_c(windows: np.ndarray) -> np.ndarray:
+            if windows.ndim != 4:
+                return windows
+            # Expect one of the last two axes to be the SO(3) "channels" axis (9).
+            if int(windows.shape[-1]) == 9:
+                return windows  # already (B, W, L, C)
+            if int(windows.shape[-2]) == 9:
+                return np.swapaxes(windows, -1, -2)  # (B, W, C, L) -> (B, W, L, C)
+            return windows
+
+        driver_np = _ensure_b_w_l_c(driver_np)
+        solution_np = _ensure_b_w_l_c(solution_np)
 
         if driver_np.ndim != 4:
             raise ValueError(
@@ -85,6 +96,16 @@ class SO3DynamicsSim(DatasetProtocol):
         if solution_np.ndim != 4:
             raise ValueError(
                 f"Expected solution windows to have shape (B, W, L, C), got {solution_np.shape}"
+            )
+        if int(driver_np.shape[-1]) != 9:
+            raise ValueError(
+                "Expected driver windows to have channels=9 on the last axis, "
+                f"got shape={driver_np.shape}"
+            )
+        if int(solution_np.shape[-1]) != 9:
+            raise ValueError(
+                "Expected solution windows to have channels=9 on the last axis, "
+                f"got shape={solution_np.shape}"
             )
         if (
             driver_np.shape[0] != solution_np.shape[0]
@@ -135,7 +156,7 @@ class SO3DynamicsSim(DatasetProtocol):
             )
         if int(channels) != 9:
             raise ValueError(
-                f"Expected SO(3) rotations flattened as 9 channels, got channels={channels}"
+                f"Expected SO(3) rotations flattened as 9 channels, got channels={channels}. Total shape: {driver_np.shape}"
             )
 
         num_windows = int(self._num_windows)

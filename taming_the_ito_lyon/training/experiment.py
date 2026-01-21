@@ -1,93 +1,51 @@
 import atexit
-import dataclasses
-import json
-import jax
-import jax.random as jr
-import jax.numpy as jnp
-import equinox as eqx
-from datetime import datetime
-from tqdm.auto import tqdm
 import os
-import shutil
 import signal
 import time
-from collections.abc import Callable
+from typing import TypeVar
 
+import equinox as eqx
+import jax
+import jax.random as jr
 import optax
-from cyreal.loader import DataLoader, _LoaderState
-from taming_the_ito_lyon.training.results_gathering_fns import (
-    ResultsDict,
-)
+import jax.numpy as jnp
+from tqdm.auto import tqdm
+
+from taming_the_ito_lyon.config import Config, load_toml_config
+from taming_the_ito_lyon.config.config_options import TrainingMode
+from taming_the_ito_lyon.models import Model
 from taming_the_ito_lyon.training.factories import (
     create_model,
     create_optimizer,
-    create_dataloaders,
-    create_unconditional_control_sampler_batched,
-    create_grad_batch_loss_fns,
     configure_jax,
-    create_results_gathering_fn,
 )
-from taming_the_ito_lyon.config import (
-    Config,
+from taming_the_ito_lyon.training.io import (
+    format_loss,
+    finalize_training_run,
+    get_run_dirname,
+    write_test_metrics,
 )
-from taming_the_ito_lyon.config.config_options import TrainingMode
-from taming_the_ito_lyon.models import Model
-from taming_the_ito_lyon.config.config_options import Datasets
+from taming_the_ito_lyon.training.loops import run_eval_epoch, run_train_epoch
+from taming_the_ito_lyon.training.runtime import build_runtime
 
 SAVED_MODELS_DIR = "saved_models"
 
-
-def _get_run_dirname(model_name: str) -> str:
-    """Generate a human-readable directory name like 'nrde_10_25pm_26_11_25'."""
-    now = datetime.now()
-    time_str = now.strftime("%I_%M%p").lower()
-    date_str = now.strftime("%d_%m_%y")
-    return f"{model_name}_{time_str}_{date_str}"
+T = TypeVar("T")
 
 
-def experiment(config: Config, config_path: str | None = None) -> None:
+def experiment(
+    config: Config, config_path: str | None = None, return_metrics: bool = False
+) -> dict[str, float | str] | None:
     configure_jax()
     model_name = config.experiment_config.model_type.value
-    loss_label: str = str(config.experiment_config.loss.value)
     model_key, loader_key = jr.split(jr.PRNGKey(config.experiment_config.seed), 2)
-    mode = config.experiment_config.training_mode
 
-    train_loader, val_loader, test_loader = create_dataloaders(config=config)
-    train_loader_state = train_loader.init_state(loader_key)
-    val_loader_state = val_loader.init_state(loader_key)
-    test_loader_state = test_loader.init_state(loader_key)
-
-    train_iterate = jax.jit(train_loader.next)
-    val_iterate = jax.jit(val_loader.next)
-    test_iterate = jax.jit(test_loader.next)
-
-    # Get shapes
-    shape_batch, _, _ = test_iterate(test_loader_state)
-
-    batch_size, timesteps, input_channels = shape_batch["driver"].shape
-    # `solution` may be either (B, T, C) or (B, T, 3, 3) depending on dataset.
-    # Do not infer model output head size from this blindly.
-    ts_full = jnp.linspace(0.0, 1.0, timesteps, dtype=shape_batch["solution"].dtype)
-
-    if mode == TrainingMode.UNCONDITIONAL:
-        # Model consumes (time + sampled driver channels)
-        uncond_dim = config.experiment_config.unconditional_driver_dim
-        assert uncond_dim is not None
-        input_path_dim = int(uncond_dim) + 1  # time concat
-    elif config.experiment_config.extrapolation_scheme is not None:
-        input_path_dim = int(input_channels) + 1  # time concat
-    else:
-        input_path_dim = input_channels
-
-    # For SO(3) simulation with rotational-geodesic loss we train a 6D head and
-    # Gram–Schmidt it into a (3,3) rotation matrix via SO3.from_6d.
-    is_so3_rge = config.experiment_config.dataset_name == Datasets.SG_SO3_SIMULATION
-    output_head_dim = 6 if is_so3_rge else int(shape_batch["solution"].shape[-1])
+    runtime = build_runtime(config, loader_key)
 
     model: Model = create_model(
         config=config,
-        input_path_dim=input_path_dim,
-        output_path_dim=output_head_dim,
+        input_path_dim=runtime.input_path_dim,
+        output_path_dim=runtime.output_head_dim,
         key=model_key,
     )
 
@@ -95,6 +53,10 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         eqx.filter(model, eqx.is_inexact_array)
     )
     num_params = int(sum(int(x.size) for x in trainable_leaves))
+    tqdm.write(
+        f"Instantiated model '{model_name}' with {num_params:,} trainable params "
+        f"(input_path_dim={runtime.input_path_dim}, output_head_dim={runtime.output_head_dim})."
+    )
 
     optim = create_optimizer(
         optimizer_name=config.experiment_config.optimizer,
@@ -104,24 +66,6 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
-    unconditional_control_sampler = None
-    if mode == TrainingMode.UNCONDITIONAL:
-        uncond_dim = config.experiment_config.unconditional_driver_dim
-        assert uncond_dim is not None
-        assert config.experiment_config.unconditional_driver_kind is not None
-        assert config.experiment_config.unconditional_hurst is not None
-        unconditional_control_sampler = create_unconditional_control_sampler_batched(
-            driver_kind=config.experiment_config.unconditional_driver_kind,
-            driver_dim=int(uncond_dim),
-            hurst=float(config.experiment_config.unconditional_hurst),
-        )
-
-    grad_fn, batch_loss_fn = create_grad_batch_loss_fns(
-        config=config,
-        # Only used for SIGKER; for SO3+RGE we keep targets as (3,3) matrices.
-        output_path_dim=int(output_head_dim),
-    )
-
     @eqx.filter_jit(donate="all")
     def train_step(
         control_values_b: jax.Array,
@@ -129,28 +73,16 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         model: Model,
         opt_state: optax.OptState,
     ) -> tuple[jax.Array, Model, optax.OptState]:
-        loss_value, grads = grad_fn(model, control_values_b, target_b)
+        loss_value, grads = runtime.grad_fn(model, control_values_b, target_b)
         params = eqx.filter(model, eqx.is_inexact_array)
         updates, new_opt_state = optim.update(grads, opt_state, params)
         updated_model: Model = eqx.apply_updates(model, updates)
         return loss_value, updated_model, new_opt_state
 
-    @eqx.filter_jit
-    def eval_step(
-        control_values_b: jax.Array,
-        target_b: jax.Array,
-        model: Model,
-    ) -> jax.Array:
-        return batch_loss_fn(model, control_values_b, target_b)
-
-    @eqx.filter_jit
-    def predict_batch(control_values_b: jax.Array, model: Model) -> jax.Array:
-        return jax.vmap(model)(control_values_b)
-
     train_key = None
     val_key = None
     test_key = None
-    if mode == TrainingMode.UNCONDITIONAL:
+    if runtime.mode == TrainingMode.UNCONDITIONAL:
         train_key = jr.PRNGKey(config.experiment_config.seed + 1)
         val_key = jr.PRNGKey(config.experiment_config.seed + 2)
         test_key = jr.PRNGKey(config.experiment_config.seed + 3)
@@ -182,124 +114,9 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     training_start = time.perf_counter()
     final_epoch = 0
 
-    def train_epoch(
-        model: Model,
-        opt_state: optax.OptState,
-        training_mode: TrainingMode,
-        epoch_key: jax.Array | None,
-        epoch_idx: int,
-    ) -> tuple[float, Model, optax.OptState]:
-        nonlocal train_loader_state
-        # Keep accumulation on-device to avoid forcing a device sync every step.
-        total_loss = jnp.asarray(0.0, dtype=jnp.float32)
-        tqdm_every = int(config.experiment_config.tqdm_update_interval)
-        pbar = tqdm(
-            range(train_loader.steps_per_epoch),
-            desc="Training batches",
-            position=1,
-            leave=False,
-        )
-        for step_idx in pbar:
-            batch, train_loader_state, _ = train_iterate(train_loader_state)
-
-            # Get control values based on mode
-            if training_mode == TrainingMode.UNCONDITIONAL:
-                if epoch_key is None or unconditional_control_sampler is None:
-                    raise ValueError(
-                        "epoch_key and unconditional_control_sampler required for UNCONDITIONAL"
-                    )
-                step_key = jr.fold_in(jr.fold_in(epoch_key, epoch_idx), step_idx)
-                control_values_b = unconditional_control_sampler(
-                    ts_full, step_key, batch_size
-                )
-            else:
-                control_values_b = batch["driver"]
-
-            loss_value, model, opt_state = train_step(
-                control_values_b,
-                batch["solution"],
-                model,
-                opt_state,
-            )
-            total_loss = total_loss + loss_value
-
-            # Only sync to host occasionally; converting device arrays to Python
-            # scalars every step can dominate wall time.
-            if tqdm_every > 0 and (step_idx % tqdm_every == 0):
-                loss_host = float(jax.device_get(loss_value))
-                pbar.set_postfix({f"train_{loss_label}": f"{loss_host * 1e2:.3f}×10⁻²"})
-
-        steps = max(1, int(train_loader.steps_per_epoch))
-        avg_loss = float(jax.device_get(total_loss)) / float(steps)
-        return avg_loss, model, opt_state
-
-    results_gathering_fn = create_results_gathering_fn(config)
-
-    def eval_epoch(
-        model: Model,
-        loader: DataLoader,
-        iterate: Callable[
-            [_LoaderState], tuple[dict[str, jax.Array], _LoaderState, jax.Array]
-        ],
-        loader_state: _LoaderState,
-        epoch_key: jax.Array | None,
-        epoch_idx: int,
-    ) -> tuple[float, ResultsDict, _LoaderState]:
-        # Keep accumulation on-device to avoid syncing every step.
-        total_loss = jnp.asarray(0.0, dtype=jnp.float32)
-        tqdm_every = int(config.experiment_config.tqdm_update_interval)
-        # Only keep a single batch for plotting/diagnostics (avoid O(n_batches) memory).
-        preds0: jax.Array | None = None
-        targets0: jax.Array | None = None
-
-        pbar = tqdm(
-            range(loader.steps_per_epoch),
-            desc="Evaluating batches",
-            position=1,
-            leave=False,
-        )
-        for step_idx in pbar:
-            batch, loader_state, _ = iterate(loader_state)
-
-            # Get control values based on mode
-            if mode == TrainingMode.UNCONDITIONAL:
-                if epoch_key is None or unconditional_control_sampler is None:
-                    raise ValueError(
-                        "epoch_key and unconditional_control_sampler required for UNCONDITIONAL"
-                    )
-                step_key = jr.fold_in(jr.fold_in(epoch_key, epoch_idx), step_idx)
-                control_values_b = unconditional_control_sampler(
-                    ts_full, step_key, batch_size
-                )
-            else:
-                control_values_b = batch["driver"]
-
-            loss_value = eval_step(control_values_b, batch["solution"], model)
-            total_loss = total_loss + loss_value
-
-            if tqdm_every > 0 and (step_idx % tqdm_every == 0):
-                loss_host = float(jax.device_get(loss_value))
-                pbar.set_postfix({f"val_{loss_label}": f"{loss_host * 1e2:.3f}×10⁻²"})
-
-            # Save only the first batch for visualization.
-            if step_idx == 0:
-                preds0 = predict_batch(control_values_b, model)
-                targets0 = batch["solution"]
-
-        steps = max(1, int(loader.steps_per_epoch))
-        avg_loss = float(jax.device_get(total_loss)) / float(steps)
-
-        # Compute diagnostics (plots/KS/etc.) using only the first batch.
-        assert preds0 is not None and targets0 is not None
-        results_dict = results_gathering_fn(
-            preds0,
-            targets0,
-            epoch_idx,
-            times_to_save=[-1],
-            # Don't spam plots with hundreds of trajectories.
-            n_plot=min(8, int(batch_size)),
-        )
-        return avg_loss, results_dict, loader_state
+    train_loader_state = runtime.train_loader_state
+    val_loader_state = runtime.val_loader_state
+    test_loader_state = runtime.test_loader_state
 
     epoch_bar = tqdm(
         range(epochs),
@@ -309,17 +126,25 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     )
     for epoch_idx in epoch_bar:
         final_epoch = epoch_idx
-        train_loss, model, opt_state = train_epoch(
-            model, opt_state, mode, train_key, epoch_idx
+        train_loss, model, opt_state, train_loader_state = run_train_epoch(
+            runtime,
+            model,
+            opt_state,
+            train_key,
+            epoch_idx,
+            train_step,
+            train_loader_state,
         )
         min_train_loss = min(min_train_loss, train_loss)
-        val_loss, val_results_dict, val_loader_state = eval_epoch(
+        val_loss, val_results_dict, val_loader_state = run_eval_epoch(
+            runtime,
             model,
-            val_loader,
-            val_iterate,
+            runtime.val_loader,
+            runtime.val_iterate,
             val_loader_state,
             val_key,
             epoch_idx,
+            split_label="val",
         )
 
         eval_metric = (
@@ -338,9 +163,13 @@ def experiment(config: Config, config_path: str | None = None) -> None:
 
         epoch_bar.set_postfix(
             {
-                f"train_{loss_label}": f"{train_loss * 1e2:.3f}×10⁻²",
-                f"best_val_{loss_label}": f"{min_val_metric * 1e2:.3f}×10⁻² at epoch {best_epoch}",
-                "val_metric": f"{eval_metric:.3f}",
+                f"train_{runtime.loss_label}": format_loss(
+                    runtime.loss_label, train_loss
+                ),
+                f"best_val_{runtime.loss_label}": (
+                    f"{format_loss(runtime.loss_label, min_val_metric)} at epoch {best_epoch}"
+                ),
+                "val_metric": format_loss(runtime.loss_label, eval_metric),
             }
         )
 
@@ -355,13 +184,15 @@ def experiment(config: Config, config_path: str | None = None) -> None:
     # Evaluate best model on test set with KS test
     best_model: Model = eqx.tree_deserialise_leaves(temp_best_path, model)
     inference_start = time.perf_counter()
-    test_loss, test_results_dict, test_loader_state = eval_epoch(
+    test_loss, test_results_dict, test_loader_state = run_eval_epoch(
+        runtime,
         best_model,
-        test_loader,
-        test_iterate,
+        runtime.test_loader,
+        runtime.test_iterate,
         test_loader_state,
         test_key,
         0,
+        split_label="test",
     )
     inference_elapsed = time.perf_counter() - inference_start
 
@@ -371,57 +202,125 @@ def experiment(config: Config, config_path: str | None = None) -> None:
         else test_loss
     )
 
-    # Create run directory and save final artifacts
-    run_dirname = _get_run_dirname(model_name)
-    run_dir = os.path.join(SAVED_MODELS_DIR, run_dirname)
-    os.makedirs(run_dir, exist_ok=True)
-
-    best_path = os.path.join(run_dir, "best.eqx")
-    last_path = os.path.join(run_dir, "last.eqx")
-    metrics_path = os.path.join(run_dir, "metrics.json")
-    config_save_path = os.path.join(run_dir, "config.toml")
-
-    # Move temp best to final location
-    os.rename(temp_best_path, best_path)
+    run_dirname = get_run_dirname(model_name)
+    run_dir = finalize_training_run(
+        run_dirname=run_dirname,
+        model_name=model_name,
+        model=model,
+        temp_best_path=temp_best_path,
+        config_path=config_path,
+        num_params=num_params,
+        final_epoch=final_epoch,
+        best_epoch=best_epoch,
+        training_elapsed=training_elapsed,
+        inference_elapsed=inference_elapsed,
+        loss_label=runtime.loss_label,
+        test_eval_metric=test_eval_metric,
+        min_val_metric=min_val_metric,
+        min_train_loss=min_train_loss,
+        test_results_dict=test_results_dict,
+    )
     # Unregister cleanup since we moved the file
     atexit.unregister(cleanup_temp)
-
-    # Save last model
-    eqx.tree_serialise_leaves(last_path, model)
-
-    # Copy config file if provided
-    if config_path is not None and os.path.exists(config_path):
-        shutil.copy2(config_path, config_save_path)
-
-    # Save metrics
-    metrics = {
-        "run": {
-            "name": run_dirname,
-            "total_epochs": final_epoch + 1,
-            "best_epoch": best_epoch,
-        },
-        "model": {
-            "type": model_name,
-            "num_params": num_params,
-        },
-        "timings": {
-            "training_s": training_elapsed,
-            "inference_s": inference_elapsed,
-        },
-        str(config.experiment_config.loss.value): {
-            "test": test_eval_metric,
-            "min_val": min_val_metric,
-            "min_train": min_train_loss,
-        },
-        "test_results_dict": dataclasses.asdict(test_results_dict),
-    }
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
 
     tqdm.write(
         f"\nResults: {num_params:,} params | "
         f"train {training_elapsed:.1f}s | "
         f"inference {inference_elapsed * 1000:.1f}ms | "
-        f"test metric {test_eval_metric:.4f}"
+        f"test metric {format_loss(runtime.loss_label, test_eval_metric)}"
     )
     tqdm.write(f"Saved to: {run_dir}/")
+
+    result = {
+        "run_dir": run_dir,
+        "min_val_metric": float(min_val_metric),
+        "test_eval_metric": float(test_eval_metric),
+        "min_train_loss": float(min_train_loss),
+        "best_epoch": int(best_epoch),
+    }
+    if return_metrics:
+        return result
+    return None
+
+
+def run_test(
+    config: Config,
+    checkpoint_path: str,
+    run_dir: str | None = None,
+) -> None:
+    configure_jax()
+    model_name = config.experiment_config.model_type.value
+    model_key, loader_key = jr.split(jr.PRNGKey(config.experiment_config.seed), 2)
+
+    runtime = build_runtime(config, loader_key)
+
+    model: Model = create_model(
+        config=config,
+        input_path_dim=runtime.input_path_dim,
+        output_path_dim=runtime.output_head_dim,
+        key=model_key,
+    )
+    model = eqx.tree_deserialise_leaves(checkpoint_path, model)
+
+    trainable_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(model, eqx.is_inexact_array)
+    )
+    num_params = int(sum(int(x.size) for x in trainable_leaves))
+    tqdm.write(
+        f"Instantiated model '{model_name}' with {num_params:,} trainable params "
+        f"(input_path_dim={runtime.input_path_dim}, output_head_dim={runtime.output_head_dim})."
+    )
+
+    test_key = None
+    if runtime.mode == TrainingMode.UNCONDITIONAL:
+        test_key = jr.PRNGKey(config.experiment_config.seed + 3)
+
+    inference_start = time.perf_counter()
+    test_loss, test_results_dict, _ = run_eval_epoch(
+        runtime,
+        model,
+        runtime.test_loader,
+        runtime.test_iterate,
+        runtime.test_loader_state,
+        test_key,
+        0,
+        split_label="test",
+    )
+    inference_elapsed = time.perf_counter() - inference_start
+
+    test_eval_metric = (
+        test_results_dict.eval_metric
+        if test_results_dict.eval_metric is not None
+        else test_loss
+    )
+
+    if run_dir is not None:
+        write_test_metrics(
+            run_dir=run_dir,
+            model_name=model_name,
+            num_params=num_params,
+            inference_elapsed=inference_elapsed,
+            loss_label=runtime.loss_label,
+            test_eval_metric=test_eval_metric,
+            test_results_dict=test_results_dict,
+            checkpoint_path=checkpoint_path,
+        )
+
+    tqdm.write(
+        f"\nResults: {num_params:,} params | "
+        f"inference {inference_elapsed * 1000:.1f}ms | "
+        f"test metric {format_loss(runtime.loss_label, test_eval_metric)}"
+    )
+    if run_dir is not None:
+        tqdm.write(f"Saved to: {run_dir}/")
+
+
+def run_test_from_run_dir(run_dir: str) -> None:
+    config_path = os.path.join(run_dir, "config.toml")
+    checkpoint_path = os.path.join(run_dir, "best.eqx")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config not found at {config_path}")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+    config = load_toml_config(config_path)
+    run_test(config, checkpoint_path=checkpoint_path, run_dir=run_dir)

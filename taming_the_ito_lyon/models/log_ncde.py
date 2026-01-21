@@ -95,6 +95,7 @@ class LogNCDE(eqx.Module):
 
     solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
     stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
+    dt0: float | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -112,6 +113,7 @@ class LogNCDE(eqx.Module):
         readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
         stepsize_controller: diffrax.AbstractStepSizeController,
+        dt0: float | None = None,
         evolving_out: bool = True,
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
@@ -150,6 +152,7 @@ class LogNCDE(eqx.Module):
         self.n_recon = n_recon
         self.solver = solver
         self.stepsize_controller = stepsize_controller
+        self.dt0 = dt0
 
     def _forward_from_logsigs(
         self, ts: jax.Array, x0: jax.Array, log_signatures: jax.Array
@@ -164,6 +167,7 @@ class LogNCDE(eqx.Module):
             y0=h0,
             solver=self.solver,
             stepsize_controller=self.stepsize_controller,
+            dt0=self.dt0,
         )
 
     def _forward_with_control(

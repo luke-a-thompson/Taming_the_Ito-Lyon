@@ -21,6 +21,16 @@ unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
 unconditional_driver_dim = 1     # number of non-time channels
 unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
 
+manifold = "euclidean"
+hidden_manifold = "euclidean"
+evolving_out = true
+
+[solver_config]
+stepsize_controller = "pid"
+rtol = 1e-3
+atol = 1e-3
+dtmin = 1e-4
+
 [nrde_config]
 
 # NRDE model parameters

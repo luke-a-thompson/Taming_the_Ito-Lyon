@@ -20,7 +20,7 @@ from .so3 import (
 import diffrax
 
 
-@partial(jax.jit, static_argnums=(2,))
+@jax.jit(static_argnums=(2,))
 def construct_polynomial_basis(t: jnp.ndarray, t_center: float, p: int) -> jnp.ndarray:
     """Construct polynomial basis matrix for Savitzky-Golay filtering.
 
@@ -341,6 +341,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
     R_center: jnp.ndarray
     _t0: float
     _t1: float
+    t_scale: jnp.ndarray
     batch_size: int
     second_order: bool
 
@@ -401,6 +402,8 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         # Allow overriding t0/t1 for extrapolation beyond fitted range
         _t0 = t0 if t0 is not None else t[0]
         _t1 = t1 if t1 is not None else t[-1]
+        t_scale = _t1 - _t0
+        t_scale = jnp.where(jnp.abs(t_scale) < 1e-8, 1.0, t_scale)
 
         # Pre-compute ALL polynomial coefficients for performance
         # This avoids expensive reconstruction in derivative() calls
@@ -468,6 +471,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         self.R_center = R_center
         self._t0 = _t0
         self._t1 = _t1
+        self.t_scale = t_scale
         self.batch_size = batch_size
         self.second_order = second_order
 
@@ -549,7 +553,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         def _fast_evaluate_single_element(phi_coeffs_single, R_center_single):
             """Fast evaluation using cached coefficients - to be vmapped."""
             # Relative time from center
-            t_rel = t_val - self.t_center
+            t_rel = (t_val - self.t_center) / self.t_scale
 
             # ULTRA-FAST phi computation using cached coefficients and normalizers
             t_powers_phi = t_rel**self.powers_phi  # (p+1,)
@@ -607,7 +611,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
             )
 
         # Relative time from center (irregular sampling compatible)
-        t_rel = t - self.t_center
+        t_rel = (t - self.t_center) / self.t_scale
 
         # DIRECT CALL to pre-compiled functions - no method indirection!
         if order == 1:
@@ -622,6 +626,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
                 self.phi_normalizers,
                 self.powers_first,
             )
+            result = result.at[..., 1:].multiply(1.0 / self.t_scale)
             if self.batch_size == 1:
                 return result[0]  # (10,)
             else:
@@ -641,6 +646,8 @@ class SO3PolynomialPath(diffrax.AbstractPath):
             )
             # Dual derivative result: ((batch_size, 10), (batch_size, 10))
             first_result, second_result = result
+            first_result = first_result.at[..., 1:].multiply(1.0 / self.t_scale)
+            second_result = second_result.at[..., 1:].multiply(1.0 / (self.t_scale**2))
             if self.batch_size == 1:
                 return first_result[0], second_result[0]  # Both (10,)
             else:
@@ -662,7 +669,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         del left  # Not used for deterministic paths
 
         # Relative time from center (irregular sampling compatible)
-        t_rel = t - self.t_center
+        t_rel = (t - self.t_center) / self.t_scale
 
         # DIRECT CALL to pre-compiled first-order function
         result = _first_order_vmap(
@@ -675,6 +682,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
             self.phi_normalizers,
             self.powers_first,
         )
+        result = result.at[..., 1:].multiply(1.0 / self.t_scale)
         if self.batch_size == 1:
             return result[0]  # (10,)
         else:
@@ -706,7 +714,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         # because it avoids the tuple unpacking and conditional logic
 
         # Relative time from center (irregular sampling compatible)
-        t_rel = t - self.t_center
+        t_rel = (t - self.t_center) / self.t_scale
 
         # DIRECT CALL to pre-compiled second-order function
         result = _second_order_vmap(
@@ -722,6 +730,7 @@ class SO3PolynomialPath(diffrax.AbstractPath):
         )
         # Extract only second derivative result
         _, second_result = result
+        second_result = second_result.at[..., 1:].multiply(1.0 / (self.t_scale**2))
         if self.batch_size == 1:
             return second_result[0]  # (10,)
         else:

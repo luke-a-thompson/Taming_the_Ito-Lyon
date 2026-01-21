@@ -74,7 +74,7 @@ class NeuralRDE(eqx.Module):
     # Modules
     initial: eqx.nn.MLP
     cde_func: NRDEFunc
-    readout: eqx.nn.Linear
+    readout_layer: eqx.nn.Linear
 
     # Static configuration
     shuffle_hopf_algebra: ShuffleHopfAlgebra = eqx.field(static=True)
@@ -86,6 +86,7 @@ class NeuralRDE(eqx.Module):
     # Solver configuration (matches NeuralCDE pattern)
     solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
     stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
+    dt0: float | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -101,8 +102,9 @@ class NeuralRDE(eqx.Module):
         *,
         key: jax.Array,
         readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
-        solver: diffrax.AbstractAdaptiveSolver = diffrax.Bosh3(),
+        solver: diffrax.AbstractAdaptiveSolver = diffrax.Tsit5(),
         stepsize_controller: diffrax.AbstractStepSizeController,
+        dt0: float | None = None,
         evolving_out: bool = True,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
@@ -126,7 +128,7 @@ class NeuralRDE(eqx.Module):
             shuffle_hopf_algebra=self.shuffle_hopf_algebra,
             key=k2,
         )
-        self.readout = eqx.nn.Linear(
+        self.readout_layer = eqx.nn.Linear(
             in_features=cde_state_dim,
             out_features=output_path_dim,
             use_bias=True,
@@ -139,6 +141,7 @@ class NeuralRDE(eqx.Module):
 
         self.solver = solver
         self.stepsize_controller = stepsize_controller
+        self.dt0 = dt0
 
     def _forward_with_values(
         self,
@@ -166,6 +169,7 @@ class NeuralRDE(eqx.Module):
             y0=h0,
             solver=self.solver,
             stepsize_controller=self.stepsize_controller,
+            dt0=self.dt0,
         )
 
     def __call__(
@@ -191,8 +195,8 @@ class NeuralRDE(eqx.Module):
         if self.evolving_out:
 
             def apply_readout(y: jax.Array) -> jax.Array:
-                return self.readout_activation(self.readout(y))
+                return self.readout_activation(self.readout_layer(y))
 
             return jax.vmap(apply_readout)(hidden_over_time)
         else:
-            return self.readout_activation(self.readout(hidden_over_time[-1]))
+            return self.readout_activation(self.readout_layer(hidden_over_time[-1]))
