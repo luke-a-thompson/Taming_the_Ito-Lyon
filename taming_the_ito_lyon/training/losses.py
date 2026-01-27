@@ -5,7 +5,6 @@ import jax.numpy as jnp
 from typing import Callable
 from stochastax.manifolds.spd import SPDManifold
 from taming_the_ito_lyon.config.config import Config
-from taming_the_ito_lyon.config.config_options import ManifoldType
 
 
 def mse_loss(
@@ -174,7 +173,7 @@ def truncated_sig_loss(
 
 def truncated_sig_loss_time_augmented(
     *,
-    depth: int = 6,
+    depth: int = 5,
     value_dim: int = 1,
     anchor_at_start: bool = True,
     prepend_zero_basepoint: bool = True,
@@ -242,6 +241,173 @@ def truncated_sig_loss_time_augmented(
         k_tt = jnp.mean(phi_target @ phi_target.T)
         k_pt = jnp.mean(phi_pred @ phi_target.T)
         return k_pp + k_tt - 2.0 * k_pt
+
+    return loss
+
+
+def branched_sigker_loss(
+    *,
+    depth: int = 5,
+    use_planar: bool,
+    use_time: bool,
+    use_w: bool,
+    anchor_at_start: bool = True,
+    prepend_zero_basepoint: bool = True,
+) -> Callable[[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array]:
+    """Branched signature-kernel score loss (biased MMD^2 with dot-product kernel).
+
+    This mirrors `truncated_sig_loss_time_augmented`, but uses a **branched Itô**
+    signature (GL/MKW Hopf algebra) as the feature map. Quadratic covariation is
+    injected via `cov_increments`, interpreted as per-step increments `Δ⟨Y⟩_k`.
+
+    Shapes
+    ------
+    - x_paths: (B, T)
+    - w_paths: (B, T) if `use_w=True`, otherwise ignored
+
+    Constructed multi-channel path Y has shape (T, d):
+    - if use_time and use_w: Y = (t, w, x), d=3
+    - if use_time and not use_w: Y = (t, x), d=2
+    - if not use_time and use_w: Y = (w, x), d=2
+    - if not use_time and not use_w: Y = (x,), d=1 (usually not recommended)
+    """
+    from stochastax.control_lifts import (
+        compute_nonplanar_branched_signature,
+        compute_planar_branched_signature,
+    )
+    from stochastax.hopf_algebras import GLHopfAlgebra, MKWHopfAlgebra
+
+    depth_i = int(depth)
+    if depth_i <= 0:
+        raise ValueError("depth must be >= 1")
+
+    d = (1 if use_time else 0) + (1 if use_w else 0) + 1
+
+    hopf_planar = (
+        MKWHopfAlgebra.build(ambient_dim=int(d), depth=int(depth_i)) if use_planar else None
+    )
+    hopf_nonplanar = (
+        GLHopfAlgebra.build(ambient_dim=int(d), depth=int(depth_i)) if not use_planar else None
+    )
+
+    def _ensure_2d_paths(x: jax.Array, name: str) -> jax.Array:
+        if x.ndim == 3 and int(x.shape[-1]) == 1:
+            x = x[..., 0]
+        if x.ndim != 2:
+            raise ValueError(f"Expected {name} shaped (B, T), got {x.shape}")
+        return x
+
+    def loss(
+        pred_x: jax.Array,
+        target_x: jax.Array,
+        pred_w: jax.Array | None = None,
+        target_w: jax.Array | None = None,
+    ) -> jax.Array:
+        pred_x_ = _ensure_2d_paths(pred_x, "pred_x")
+        target_x_ = _ensure_2d_paths(target_x, "target_x")
+        if pred_x_.shape != target_x_.shape:
+            raise ValueError(
+                f"pred_x and target_x must have the same shape, got {pred_x_.shape} and {target_x_.shape}"
+            )
+
+        if use_w:
+            if pred_w is None or target_w is None:
+                raise ValueError("use_w=True requires pred_w and target_w.")
+            pred_w_ = _ensure_2d_paths(pred_w, "pred_w")
+            target_w_ = _ensure_2d_paths(target_w, "target_w")
+            if pred_w_.shape != pred_x_.shape or target_w_.shape != target_x_.shape:
+                raise ValueError(
+                    "pred_w/target_w must match pred_x/target_x shapes, got "
+                    f"{pred_w_.shape}, {target_w_.shape} vs {pred_x_.shape}."
+                )
+        else:
+            pred_w_ = None
+            target_w_ = None
+
+        B, T = pred_x_.shape
+        if int(T) < 2 or int(B) < 1:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+
+        ts = jnp.linspace(0.0, 1.0, int(T), dtype=pred_x_.dtype)  # (T,)
+
+        def _augment_single(x_path: jax.Array, w_path: jax.Array | None) -> jax.Array:
+            if anchor_at_start:
+                x_path = x_path - x_path[:1]
+                if w_path is not None:
+                    w_path = w_path - w_path[:1]
+
+            cols: list[jax.Array] = []
+            if use_time:
+                cols.append(ts)
+            if use_w:
+                assert w_path is not None
+                cols.append(w_path)
+            cols.append(x_path)
+            y = jnp.stack(cols, axis=1)  # (T, d)
+
+            if not prepend_zero_basepoint:
+                return y
+            zero0 = jnp.zeros((1, int(d)), dtype=y.dtype)
+            return jnp.concatenate([zero0, y], axis=0)  # (T+1, d)
+
+        def _cov_increments_from_path(path: jax.Array) -> jax.Array:
+            # `cov_increments[k]` is interpreted as the per-step quadratic covariation
+            # increment Δ⟨Y⟩_k for the *true* sampled path.
+            #
+            # If we prepend a zero basepoint, the first increment (0 -> y0) is an
+            # artificial encoding of the initial level and must NOT contribute to
+            # quadratic covariation. So we pad a leading zero and compute covariation
+            # only from the true increments.
+            if prepend_zero_basepoint:
+                # path has shape (T+1, d); true increments are between path[1:] points.
+                inc_true = jnp.diff(path[1:], axis=0)  # (T-1, d)
+                cov_true = jnp.einsum("td,te->tde", inc_true, inc_true)  # (T-1, d, d)
+                cov0 = jnp.zeros((1, int(d), int(d)), dtype=path.dtype)  # (1, d, d)
+                cov = jnp.concatenate([cov0, cov_true], axis=0)  # (T, d, d)
+            else:
+                inc = jnp.diff(path, axis=0)  # (T-1, d)
+                cov = jnp.einsum("td,te->tde", inc, inc)  # (T-1, d, d)
+            if use_time:
+                cov = cov.at[:, 0, :].set(0.0)
+                cov = cov.at[:, :, 0].set(0.0)
+            # Outer products are symmetric; time-zeroing preserves symmetry.
+            return cov
+
+        def _phi_single(x_path: jax.Array, w_path: jax.Array | None) -> jax.Array:
+            path = _augment_single(x_path, w_path)
+            cov_inc = _cov_increments_from_path(path)
+            if use_planar:
+                assert hopf_planar is not None
+                sig = compute_planar_branched_signature(
+                    path,
+                    depth_i,
+                    hopf_planar,
+                    "full",
+                    cov_increments=cov_inc,
+                )
+            else:
+                assert hopf_nonplanar is not None
+                sig = compute_nonplanar_branched_signature(
+                    path,
+                    depth_i,
+                    hopf_nonplanar,
+                    "full",
+                    cov_increments=cov_inc,
+                )
+            return sig.log().flatten()
+
+        if use_w:
+            assert pred_w_ is not None and target_w_ is not None
+            phi_pred = jax.vmap(_phi_single)(pred_x_, pred_w_)
+            phi_target = jax.vmap(_phi_single)(target_x_, target_w_)
+        else:
+            phi_pred = jax.vmap(lambda x: _phi_single(x, None))(pred_x_)
+            phi_target = jax.vmap(lambda x: _phi_single(x, None))(target_x_)
+
+        k_pp = jnp.mean(phi_pred @ phi_pred.T)
+        k_tt = jnp.mean(phi_target @ phi_target.T)
+        k_pt = jnp.mean(phi_pred @ phi_target.T)
+        return (k_pp + k_tt - 2.0 * k_pt).astype(jnp.float32)
 
     return loss
 

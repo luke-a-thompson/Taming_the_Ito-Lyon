@@ -14,6 +14,7 @@ LOSS_METRICS: dict[str, dict[str, float | str]] = {
     "mse": {"scale": 1.0, "unit": ""},
     "rge": {"scale": 1.0, "unit": ""},
     "sigker": {"scale": 1.0, "unit": ""},
+    "sigker_branched": {"scale": 1.0, "unit": ""},
     "frobenius": {"scale": 1.0, "unit": ""},
 }
 

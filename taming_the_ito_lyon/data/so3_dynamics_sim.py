@@ -38,7 +38,7 @@ class SO3DynamicsSim(DatasetProtocol):
         skip = int(0.1 / dt_sim)  # keep every 10th frame
         if skip < 1:
             skip = 1
-        print(f"Downsample rate: {skip} (effective dt = {dt_sim * skip})")
+        # print(f"Downsample rate: {skip} (effective dt = {dt_sim * skip})")
 
         train_fraction = float(self.config.experiment_config.train_fraction)
         val_fraction = float(self.config.experiment_config.val_fraction)

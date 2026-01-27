@@ -453,10 +453,17 @@ def create_grad_batch_loss_fns(
         mse_loss,
         rotational_geodesic_loss,
         truncated_sig_loss_time_augmented,
+        branched_sigker_loss,
         frobenius_loss,
         ito_level2_distribution_mmd_loss,
         _maybe_unvech_spd,
     )
+
+    loss_fn: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+    base_branched_loss_fn: (
+        Callable[[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array] | None
+    ) = None
+    sigker_branched_use_w = False
 
     match config.experiment_config.loss:
         case LossType.MSE:
@@ -483,13 +490,49 @@ def create_grad_batch_loss_fns(
                 anchor_at_start=False,
                 prepend_zero_basepoint=True,
             )
+        case LossType.SIGKER_BRANCHED:
+            if output_path_dim is None:
+                raise ValueError(
+                    "output_path_dim must be provided when loss_type is SIGKER_BRANCHED so the "
+                    "Hopf algebra can be constructed outside of jit."
+                )
+            if int(output_path_dim) != 1:
+                raise ValueError(
+                    "SIGKER_BRANCHED currently supports scalar outputs only (output_path_dim=1)."
+                )
+            # Use planar branched signature iff the configured Hopf algebra is MKW.
+            use_planar = bool(
+                hasattr(config.nn_config, "hopf_algebra")
+                and getattr(config.nn_config, "hopf_algebra") == HopfAlgebraType.MKW
+            )
+            # Include the driver channel for rough-volatility datasets where we have W.
+            sigker_branched_use_w = bool(
+                config.experiment_config.dataset_name
+                in (
+                    Datasets.BLACK_SCHOLES,
+                    Datasets.BERGOMI,
+                    Datasets.ROUGH_BERGOMI,
+                    Datasets.SIMPLE_RBERGOMI,
+                )
+            )
+            base_branched_loss_fn = branched_sigker_loss(
+                depth=5,
+                use_planar=use_planar,
+                use_time=True,
+                use_w=bool(sigker_branched_use_w),
+                anchor_at_start=False,
+                prepend_zero_basepoint=True,
+            )
         case _:
             raise ValueError(f"Unknown loss type: {config.experiment_config.loss}")
 
+    if loss_fn is None and base_branched_loss_fn is None:
+        raise RuntimeError("No base loss configured.")
+
     use_spd = config.experiment_config.manifold == ManifoldType.SPD
-    if use_spd and config.experiment_config.loss == LossType.SIGKER:
+    if use_spd and config.experiment_config.loss in (LossType.SIGKER, LossType.SIGKER_BRANCHED):
         raise ValueError(
-            "SIGKER loss expects vector-valued paths. For SPD outputs, use MSE or "
+            "SIGKER/SIGKER_BRANCHED loss expects vector-valued paths. For SPD outputs, use MSE or "
             "FROBENIUS and enable SPD manifold output."
         )
 
@@ -511,7 +554,24 @@ def create_grad_batch_loss_fns(
         if use_spd:
             preds = _maybe_unvech_spd(preds)
             target_b = _maybe_unvech_spd(target_b)
-        base = loss_fn(preds, target_b)
+        if config.experiment_config.loss == LossType.SIGKER_BRANCHED:
+            # X_model/X_gt: log-price paths (channel 0).
+            x_model = preds[..., 0]
+            x_gt = target_b[..., 0]
+            assert base_branched_loss_fn is not None
+            if sigker_branched_use_w:
+                w_model = (
+                    control_values_b[..., 1]
+                    if int(control_values_b.shape[-1]) >= 2
+                    else control_values_b[..., 0]
+                )
+                w_gt = gt_driver_b[..., 0]
+                base = base_branched_loss_fn(x_model, x_gt, w_model, w_gt)
+            else:
+                base = base_branched_loss_fn(x_model, x_gt, None, None)
+        else:
+            assert loss_fn is not None
+            base = loss_fn(preds, target_b)
 
         if not use_ito_mmd_loss or ito_weight <= 0.0:
             return base
@@ -547,7 +607,23 @@ def create_grad_batch_loss_fns(
         if use_spd:
             preds = _maybe_unvech_spd(preds)
             target_b = _maybe_unvech_spd(target_b)
-        base = loss_fn(preds, target_b)
+        if config.experiment_config.loss == LossType.SIGKER_BRANCHED:
+            x_model = preds[..., 0]
+            x_gt = target_b[..., 0]
+            assert base_branched_loss_fn is not None
+            if sigker_branched_use_w:
+                w_model = (
+                    control_values_b[..., 1]
+                    if int(control_values_b.shape[-1]) >= 2
+                    else control_values_b[..., 0]
+                )
+                w_gt = gt_driver_b[..., 0]
+                base = base_branched_loss_fn(x_model, x_gt, w_model, w_gt)
+            else:
+                base = base_branched_loss_fn(x_model, x_gt, None, None)
+        else:
+            assert loss_fn is not None
+            base = loss_fn(preds, target_b)
         if not use_ito_mmd_loss or ito_weight <= 0.0:
             return base
 

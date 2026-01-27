@@ -1273,7 +1273,7 @@ wheels = [
 [[package]]
 name = "stochastax"
 version = "0.5.0"
-source = { git = "https://github.com/luke-a-thompson/Stochastax.git?branch=ArbitraryDepthBranchedRP#465808c8a981f792508a501afe56bbbc1f1c6544" }
+source = { git = "https://github.com/luke-a-thompson/Stochastax.git?branch=ArbitraryDepthBranchedRP#4b4710c0ec97cdf52263b498269642a39b9cef15" }
 dependencies = [
     { name = "diffrax" },
     { name = "jax" },

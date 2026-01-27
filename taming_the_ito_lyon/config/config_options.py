@@ -73,6 +73,7 @@ class LossType(StrEnum):
     MSE = "mse"
     RGE = "rge"
     SIGKER = "sigker"
+    SIGKER_BRANCHED = "sigker_branched"
     FROBENIUS = "frobenius"
 
 
