@@ -16,9 +16,7 @@ epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
-unconditional_driver_dim = 1     # number of non-time channels
-unconditional_hurst = 0.5        # used for "fbm"/"rl"
+# Unconditional generation samples a Brownian motion with this many channels.
 
 manifold = "euclidean"
 hidden_manifold = "euclidean"
@@ -44,6 +42,5 @@ out_size = 1
 signature_depth = 2
 signature_window_size = 16
 
-# Planar branched Hopf algebra (Ito / non-geometric lift)
-hopf_algebra = "mkw"
-
+hopf_algebra = "shuffle"
+brownian_channels = [2]

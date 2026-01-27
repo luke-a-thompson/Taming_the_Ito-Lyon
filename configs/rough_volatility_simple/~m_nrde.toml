@@ -1,6 +1,6 @@
 [experiment_config]
 model_type = "mnrde"
-dataset_name = "rough_bergomi"
+dataset_name = "simple_rbergomi"
 
 # Optimizer
 optimizer = "adamw"
@@ -16,9 +16,7 @@ epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-unconditional_driver_kind = "rl" # "bm" | "fbm" | "rl"
-unconditional_driver_dim = 1     # number of non-time channels
-unconditional_hurst = 0.33        # used for "fbm"/"rl"
+# Unconditional generation always uses a single Brownian driver W (time is prepended).
 
 manifold = "euclidean"
 hidden_manifold = "euclidean"
@@ -44,6 +42,4 @@ out_size = 1
 signature_depth = 2
 signature_window_size = 16
 
-# Branched Hopf algebra (Ito / non-geometric lift)
 hopf_algebra = "gl"
-

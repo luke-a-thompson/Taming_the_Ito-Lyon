@@ -1,19 +1,23 @@
 from __future__ import annotations
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
 from cyreal.datasets.dataset_protocol import DatasetProtocol
 from cyreal.datasets.utils import to_host_jax_array
-import jax
-import numpy as np
-from typing import Literal
-from cyreal.datasets.time_utils import make_sequence_disk_source
+from cyreal.sources import ArraySource
+from stochastax.manifolds.spd import SPDManifold
 from taming_the_ito_lyon.config import Config
-from taming_the_ito_lyon.config.config_options import Datasets
-from cyreal.sources import ArraySource, DiskSource
-from dataclasses import field
 
 
 @dataclass
-class RoughVolatilityDataset(DatasetProtocol):
+class SPDCovarianceDataset(DatasetProtocol):
+    """Dataset wrapper for windowed SPD covariance sequences."""
+
     config: Config
     split: Literal["train", "val", "test"]
     ordering: Literal["sequential", "shuffle"] = field(init=False)
@@ -21,30 +25,26 @@ class RoughVolatilityDataset(DatasetProtocol):
     def __post_init__(self) -> None:
         self.ordering = "shuffle" if self.split == "train" else "sequential"
 
-        data = np.load(self.config.experiment_config.dataset_name.value)
-        driver = np.asarray(data["driver"], dtype=np.float32)
-        solution = np.asarray(data["solution"], dtype=np.float32)
+        raw = np.load(
+            self.config.experiment_config.dataset_name.value, allow_pickle=False
+        )
+        if isinstance(raw, np.lib.npyio.NpzFile):
+            if "covariances" not in raw:
+                raise ValueError(
+                    f"Expected 'covariances' in npz, got keys={list(raw.files)}"
+                )
+            raw = raw["covariances"]
 
-        # For rough-volatility datasets the .npz contains multiple channels, but the
-        # training pipeline is set up to learn a single target channel (e.g. price).
-        # Keep only the first channel for both driver and solution to match the
-        # behavior in `taming_the_ito_lyon.data.datasets.prepare_dataset`.
-        if self.config.experiment_config.dataset_name in (
-            Datasets.BLACK_SCHOLES,
-            Datasets.BERGOMI,
-            Datasets.ROUGH_BERGOMI,
-        ):
-            driver = driver[..., 0:1]
-            solution = solution[..., 0:1]
+        matrices = np.asarray(raw, dtype=np.float32)
+        if matrices.ndim == 3:
+            matrices = matrices[None, ...]
+        if matrices.ndim != 4:
+            raise ValueError(
+                f"Expected (B, T, N, N) or (T, N, N), got {matrices.shape}"
+            )
 
-        if driver.shape != solution.shape:
-            raise ValueError(
-                f"driver and solution must have the same shape, got {driver.shape} and {solution.shape}"
-            )
-        if driver.ndim != 3:
-            raise ValueError(
-                f"Expected arrays shaped (num_examples, T, C), got driver shape {driver.shape}"
-            )
+        solution = np.asarray(SPDManifold.vech(jnp.asarray(matrices)), dtype=np.float32)
+        driver = np.zeros((solution.shape[0], solution.shape[1], 1), dtype=np.float32)
 
         train_fraction = float(self.config.experiment_config.train_fraction)
         val_fraction = float(self.config.experiment_config.val_fraction)
@@ -78,21 +78,8 @@ class RoughVolatilityDataset(DatasetProtocol):
         return {"driver": self._driver, "solution": self._solution}
 
     def make_array_source(self) -> ArraySource:
-        dataset = RoughVolatilityDataset(config=self.config, split=self.split)
-        array_source = ArraySource(dataset.as_array_dict(), ordering=self.ordering)
-        return array_source
-
-    def make_disk_source(
-        self,
-    ) -> DiskSource:
-        dataset = RoughVolatilityDataset(config=self.config, split=self.split)
-        disk_source = make_sequence_disk_source(
-            contexts=np.asarray(dataset._driver),
-            targets=np.asarray(dataset._solution),
-            ordering=self.ordering,
-            prefetch_size=128,
-        )
-        return disk_source
+        dataset = SPDCovarianceDataset(config=self.config, split=self.split)
+        return ArraySource(dataset.as_array_dict(), ordering=self.ordering)
 
 
 def _select_example_split(
@@ -102,8 +89,12 @@ def _select_example_split(
     train_fraction: float,
     val_fraction: float = 0.0,
 ) -> np.ndarray:
-    """Split independent examples along axis 0 (no overlap)."""
-    n = int(len(array))
+    """Split along the time axis (axis=1) without mixing trajectories."""
+    if array.ndim < 2:
+        raise ValueError(
+            f"Expected array with at least 2 dims (B, T, ...), got shape {array.shape}"
+        )
+    n = int(array.shape[1])
     if n <= 0:
         raise ValueError("Array must be non-empty.")
     if not 0.0 < train_fraction < 1.0:
@@ -120,18 +111,17 @@ def _select_example_split(
         val_end = train_end
 
     if split == "train":
-        return array[:train_end]
+        return array[:, :train_end, ...]
     if split == "val":
         if val_fraction == 0.0:
             raise ValueError("val_fraction must be > 0 when split='val'.")
-        return array[train_end:val_end]
-    return array[val_end:]
-
+        return array[:, train_end:val_end, ...]
+    return array[:, val_end:, ...]
 
 if __name__ == "__main__":
     from taming_the_ito_lyon.config.config import load_toml_config
 
-    config = load_toml_config("configs/rough_volatility/~m_nrde.toml")
-    dataset = RoughVolatilityDataset(config, "train")
+    config = load_toml_config("configs/spd_covariance/~m_nrde.toml")
+    dataset = SPDCovarianceDataset(config, "train")
     print(dataset._driver.shape)
     print(dataset._solution.shape)

@@ -47,6 +47,9 @@ def compute_windowed_logsignatures_from_values(
     hopf_algebra: HopfAlgebra,
     signature_depth: int,
     signature_window_size: int,
+    *,
+    brownian_channels: list[int] | None = None,
+    brownian_corr: float | None = None,
 ) -> jax.Array:
     """Compute disjoint windowed log-signatures (flattened) from sampled control values.
 
@@ -66,6 +69,11 @@ def compute_windowed_logsignatures_from_values(
         Number of *intervals* per (disjoint) window. Each window is represented using
         `signature_window_size + 1` points, and windows start at indices
         `0, signature_window_size, 2*signature_window_size, ...`.
+    brownian_channels:
+        Indices of Brownian channels in the full control (time is index 0). If None,
+        all non-time channels are treated as Brownian for Itô covariation.
+    brownian_corr:
+        Optional correlation to apply between the first two Brownian channels.
 
     Returns
     -------
@@ -87,16 +95,32 @@ def compute_windowed_logsignatures_from_values(
     dt = jnp.asarray(1.0 / float(int(values.shape[0]) - 1), dtype=values.dtype)
 
     def _brownian_cov_increments(num_increments: int, dim: int) -> jax.Array:
-        # Covariance for increments of (t, W): [dt for W dims on the diagonal; 0 for t]
-        # Shape: (num_increments, dim, dim)
+        """Covariance for increments of (t, W) with optional correlation.
+
+        `brownian_channels` indexes channels in the full control (time at index 0).
+        If None, all non-time channels are treated as Brownian.
+        """
         if dim < 2:
             raise ValueError(
                 "Branched (Itô) signature requires at least 2 channels: time + Brownian."
             )
-        diag = jnp.concatenate(
-            [jnp.zeros((1,), dtype=values.dtype), jnp.full((dim - 1,), dt)], axis=0
-        )
-        cov1 = jnp.diag(diag)  # (dim, dim)
+        if brownian_channels is None:
+            brownian_idxs = list(range(1, dim))
+        else:
+            brownian_idxs = [int(i) for i in brownian_channels]
+            if any(i <= 0 or i >= dim for i in brownian_idxs):
+                raise ValueError(
+                    f"brownian_channels must be in [1, {dim - 1}], got {brownian_idxs}"
+                )
+        cov1 = jnp.zeros((dim, dim), dtype=values.dtype)
+        for idx in brownian_idxs:
+            cov1 = cov1.at[idx, idx].set(dt)
+        if brownian_corr is not None and len(brownian_idxs) >= 2:
+            rho = jnp.asarray(brownian_corr, dtype=values.dtype)
+            i0 = brownian_idxs[0]
+            i1 = brownian_idxs[1]
+            cov1 = cov1.at[i0, i1].set(rho * dt)
+            cov1 = cov1.at[i1, i0].set(rho * dt)
         return jnp.broadcast_to(cov1, (num_increments, dim, dim))
 
     def window_logsig(i: jax.Array) -> jax.Array:

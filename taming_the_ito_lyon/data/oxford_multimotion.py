@@ -10,15 +10,15 @@ import numpy as np
 from cyreal.datasets.dataset_protocol import DatasetProtocol
 from cyreal.datasets.time_utils import prepare_seq_to_seq_windows
 from taming_the_ito_lyon.config import Config
+from cyreal.sources import DiskSource
 from taming_the_ito_lyon.data.integrity_checks import (
     ensure_b_w_l_c,
     validate_window_alignment,
 )
-from cyreal.sources import DiskSource
 
 
 @dataclass
-class SO3DynamicsSim(DatasetProtocol):
+class OxfordMultimotionDataset(DatasetProtocol):
     config: Config
     split: Literal["train", "val", "test"]
     ordering: Literal["sequential", "shuffle"] = field(init=False)
@@ -33,39 +33,27 @@ class SO3DynamicsSim(DatasetProtocol):
 
         data = np.load(self.config.experiment_config.dataset_name.value)
         dt_sim = float(
-            np.asarray(data["dt"])
+            np.asarray(np.diff(data["t"])).mean()
         )  # This is a scalar dt for the whole simulation
-        skip = int(0.1 / dt_sim)  # keep every 10th frame
+        skip = int(1 / dt_sim)
         if skip < 1:
             skip = 1
-        print(f"Downsample rate: {skip} (effective dt = {dt_sim * skip})")
+        print(f"Downsample rate: {skip} (effective dt = {dt_sim * skip:.3f})")
 
         train_fraction = float(self.config.experiment_config.train_fraction)
         val_fraction = float(self.config.experiment_config.val_fraction)
 
-        damping0_rotmat = data["R_sim_damped0"]
-        damping1_rotmat = data["R_sim_damped1"]
-        damping2_rotmat = data["R_sim_damped2"]
-        damping3_rotmat = data["R_sim_damped3"]
-        # Flatten 3x3 -> 9 so the model sees shape (B, T, 9)
+        box1_rotmat = data["R_box1"]
+        box2_rotmat = data["R_box2"]
+        box3_rotmat = data["R_box3"]
+        box4_rotmat = data["R_box4"]
+
         rotmats = np.stack(
-            [damping0_rotmat, damping1_rotmat, damping2_rotmat, damping3_rotmat],
-            axis=2,
+            [box1_rotmat, box2_rotmat, box3_rotmat, box4_rotmat],
+            axis=1,
         )
-        batch_size, timesteps, boxes, _, _ = rotmats.shape
-        # (Batch * 4, Timesteps, 9)
-        rotmats_flat = rotmats.transpose(0, 2, 1, 3, 4).reshape(
-            batch_size * boxes, timesteps, 9
-        )
-        # Downsample first, then build 20-step windows on the downsampled sequence.
-        # This makes each window correspond to indices:
-        #   start : start + skip*20 : skip
-        # on the original simulation grid, while the sliding-window stride is 1 on
-        # the downsampled grid.
-        rotmats_flat = rotmats_flat[:, ::skip, :]
-        # NOTE: `prepare_seq_to_seq_windows` returns NumPy arrays. With the updated
-        # `cyreal.datasets.time_utils.sliding_window_many`, these are typically
-        # *views* (stride-trick windows), not fully materialized copies.
+        timesteps, boxes, _, _ = rotmats.shape
+        rotmats_flat = rotmats.reshape(timesteps, boxes, 9).transpose(1, 0, 2)
         driver_np, solution_np = prepare_seq_to_seq_windows(
             input_sequence=rotmats_flat,
             target_sequence=rotmats_flat,
@@ -77,12 +65,6 @@ class SO3DynamicsSim(DatasetProtocol):
             sliding_window_stride=1,
         )
 
-        # `np.lib.stride_tricks.sliding_window_view` appends the window axis at the end.
-        # For sequences shaped (B, T, C) this yields windows shaped (B, W, C, L).
-        # We want (B, W, L, C) for downstream code and batching.
-        #
-        # Historically this was hard-coded for L=20; instead, normalize by ensuring the
-        # channel axis (C=9) is last.
         driver_np = ensure_b_w_l_c("driver", driver_np)
         solution_np = ensure_b_w_l_c("solution", solution_np)
         validate_window_alignment(driver_np, solution_np)
@@ -163,7 +145,7 @@ class SO3DynamicsSim(DatasetProtocol):
 if __name__ == "__main__":
     from taming_the_ito_lyon.config.config import load_toml_config
 
-    config = load_toml_config("configs/sg_so3_sim/m_nrde_mlp.toml")
-    dataset = SO3DynamicsSim(config, "train")
+    config = load_toml_config("configs/oxford_mm/m_nrde_mlp.toml")
+    dataset = OxfordMultimotionDataset(config, "train")
     print(dataset._driver_np.shape)
     print(dataset._solution_np.shape)

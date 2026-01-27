@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import math
 import jax
 import jax.numpy as jnp
-from typing import Callable, Optional, Sequence, Union, Literal
+from typing import Callable
+from stochastax.manifolds.spd import SPDManifold
 from taming_the_ito_lyon.config.config import Config
+from taming_the_ito_lyon.config.config_options import ManifoldType
 
 
 def mse_loss(
@@ -158,18 +159,22 @@ def truncated_sig_loss(
 
         # Dot-product kernel on features: k(x, y) = <phi(x), phi(y)>
         k_pp = jnp.mean(phi_pred @ phi_pred.T)
+        k_tt = jnp.mean(phi_target @ phi_target.T)
         k_pt = jnp.mean(phi_pred @ phi_target.T)
 
-        # Expected kernel score averaged over y~target:
-        # E_y[ φ(P, y) ] = E_{x,x'~P}[k(x,x')] - 2 E_{x~P, y~target}[k(x,y)]
-        return k_pp - 2.0 * k_pt
+        # Biased MMD^2 (kernel score):
+        #   E[k(X,X')] + E[k(Y,Y')] - 2 E[k(X,Y)]
+        #
+        # Note: k_tt is independent of model params, so adding it shifts the loss
+        # but does not change gradients.
+        return k_pp + k_tt - 2.0 * k_pt
 
     return loss
 
 
 def truncated_sig_loss_time_augmented(
     *,
-    depth: int = 5,
+    depth: int = 6,
     value_dim: int = 1,
     anchor_at_start: bool = True,
     prepend_zero_basepoint: bool = True,
@@ -234,168 +239,143 @@ def truncated_sig_loss_time_augmented(
         phi_target = jax.vmap(_phi)(target)
 
         k_pp = jnp.mean(phi_pred @ phi_pred.T)
+        k_tt = jnp.mean(phi_target @ phi_target.T)
         k_pt = jnp.mean(phi_pred @ phi_target.T)
-        return k_pp - 2.0 * k_pt
+        return k_pp + k_tt - 2.0 * k_pt
 
     return loss
 
 
-def weighted_truncated_signature_score(
-    depth: int = 4,
-    ambient_dim: int = 1,
-    phi: Optional[
-        Union[
-            Literal["uniform", "exponential", "factorial"],
-            Callable[[int], float],
-            Sequence[float],
-            jax.Array,
-        ]
-    ] = "factorial",
-    include_level0: bool = True,
+def _maybe_unvech_spd(
+    x: jax.Array,
+) -> jax.Array:
+    if x.ndim >= 2 and x.shape[-2:] == (3, 3):
+        return x
+    if x.shape[-1] == 6:
+        return SPDManifold.unvech(x)
+    return x
+
+
+def _ito_level12_feature_vectors(
     *,
-    time_augment: bool = True,
-    anchor_at_start: bool = True,
-    prepend_zero_basepoint: bool = True,
-) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """
-    Weighted expected signature score (which equals the biased MMD^2 for the weighted
-    linear signature kernel).
-
-    We define a weighted inner product on the truncated tensor algebra by
-        <a,b>_phi = sum_{k=0}^depth phi(k) <a_k, b_k>_k
-    and the induced kernel
-        k_phi(x,y) = <S^{<=depth}(x), S^{<=depth}(y)>_phi.
-
-    With the feature map Psi_phi(x) = concat_k sqrt(phi(k)) * vec(S_k(x)),
-    the score is
-        || E[Psi_phi(X)] - E[Psi_phi(Y)] ||^2
-    which is exactly the (biased) empirical MMD^2 for k_phi.
-
-    Notes
-    -----
-    - This assumes compute_path_signature returns signature levels concatenated by level,
-      with level-k having ambient_dim**k coordinates (word basis).
-    - Set include_level0=False if your signature vector omits the empty-word term.
+    w_paths: jax.Array,
+    x_paths: jax.Array,
+    include_level1: bool = True,
+) -> jax.Array:
+    """Compute per-path Itô / branched level-1/2 features from (W, X).
 
     Args:
-        depth: Truncation depth for the signature.
-        ambient_dim: Dimension of the value path space; if time_augment=True the
-            signature ambient dimension becomes ambient_dim + 1.
-        phi: Level weights. Can be one of {"uniform", "exponential", "factorial"}, a
-            callable mapping level k to weight, a sequence/array of weights, or None
-            (uniform weights).
-        include_level0: Whether to include level 0 (empty word) in the signature.
-        time_augment: If True, augment paths as (t, x_t) before computing signatures.
-        anchor_at_start: If True, subtract x0 before augmentation.
-        prepend_zero_basepoint: If True, prepend a zero basepoint after augmentation.
+        w_paths: (B, T) latent/driver BM paths.
+        x_paths: (B, T) output log-price paths.
+        include_level1: If True, include sum(dW) and sum(dX) as extra features.
 
     Returns:
-        Loss function that takes (pred, target) arrays and returns a scalar loss.
+        (B, D) feature matrix with columns:
+            [qvW, qvX, covWX, (optional: sum_dW, sum_dX)].
     """
-    from stochastax.control_lifts import compute_path_signature
-    from stochastax.hopf_algebras.hopf_algebras import ShuffleHopfAlgebra
+    if w_paths.ndim != 2 or x_paths.ndim != 2:
+        raise ValueError(
+            f"Expected w_paths/x_paths shaped (B, T), got {w_paths.shape} and {x_paths.shape}"
+        )
+    if w_paths.shape != x_paths.shape:
+        raise ValueError(
+            f"w_paths and x_paths must have the same shape, got {w_paths.shape} and {x_paths.shape}"
+        )
+    if int(w_paths.shape[1]) < 2:
+        b = int(w_paths.shape[0])
+        d = 5 if include_level1 else 3
+        return jnp.zeros((b, d), dtype=jnp.float32)
 
-    value_dim_int = int(ambient_dim)
-    effective_dim = value_dim_int + 1 if time_augment else value_dim_int
-    hopf = ShuffleHopfAlgebra.build(ambient_dim=effective_dim, depth=int(depth))
+    dW = jnp.diff(w_paths, axis=1)  # (B, T-1)
+    dX = jnp.diff(x_paths, axis=1)  # (B, T-1)
 
-    if include_level0:
-        level_sizes = [int(effective_dim**k) for k in range(0, int(depth) + 1)]
-        level_ids = list(range(0, int(depth) + 1))
+    qvW = jnp.sum(dW * dW, axis=1)
+    qvX = jnp.sum(dX * dX, axis=1)
+    covWX = jnp.sum(dW * dX, axis=1)
+
+    if include_level1:
+        sum_dW = jnp.sum(dW, axis=1)
+        sum_dX = jnp.sum(dX, axis=1)
+        feat = jnp.stack([qvW, qvX, covWX, sum_dW, sum_dX], axis=1)
     else:
-        level_sizes = [int(effective_dim**k) for k in range(1, int(depth) + 1)]
-        level_ids = list(range(1, int(depth) + 1))
+        feat = jnp.stack([qvW, qvX, covWX], axis=1)
 
-    total_size = int(sum(level_sizes))
+    return feat.astype(jnp.float32)
 
-    if phi is None or phi == "uniform":
-        weights = jnp.ones((len(level_ids),), dtype=jnp.float32)
-    elif phi == "exponential":
-        weights = jnp.asarray(
-            [float(math.exp(-k)) for k in level_ids], dtype=jnp.float32
+
+def _rbf_mmd2_median_heuristic(
+    x: jax.Array,
+    y: jax.Array,
+    *,
+    eps: float = 1e-12,
+    max_bandwidth_points: int = 256,
+) -> jax.Array:
+    """Biased RBF-kernel MMD^2 with median-heuristic bandwidth."""
+    if x.ndim != 2 or y.ndim != 2:
+        raise ValueError(f"Expected 2D feature matrices, got {x.shape} and {y.shape}")
+    if int(x.shape[1]) != int(y.shape[1]):
+        raise ValueError(
+            f"x and y must have the same feature dimension, got {x.shape} and {y.shape}"
         )
-    elif phi == "factorial":
-        weights = jnp.asarray(
-            [float(1.0 / math.factorial(k)) for k in level_ids], dtype=jnp.float32
-        )
-    elif callable(phi):
-        weights = jnp.asarray([float(phi(k)) for k in level_ids], dtype=jnp.float32)
-    else:
-        weights = jnp.asarray(phi, dtype=jnp.float32)
-        if weights.shape[0] != len(level_ids):
-            raise ValueError(
-                f"`phi` must have length {len(level_ids)} (levels={level_ids}), got {weights.shape[0]}."
-            )
 
-    if bool(jnp.any(weights < 0)):
-        raise ValueError("All level weights phi(k) must be nonnegative.")
+    nx = int(x.shape[0])
+    ny = int(y.shape[0])
+    if nx == 0 or ny == 0:
+        return jnp.asarray(0.0, dtype=jnp.float32)
 
-    sqrt_weights = jnp.sqrt(weights)
+    pooled = jnp.concatenate([x, y], axis=0)
+    m = min(int(max_bandwidth_points), int(pooled.shape[0]))
+    pooled_m = pooled[:m]
 
-    # Precompute static slices for each level in the flattened signature vector
-    slices: list[tuple[int, int]] = []
-    start = 0
-    for size in level_sizes:
-        end = start + int(size)
-        slices.append((start, end))
-        start = end
+    # Pairwise squared distances on pooled subset (m, m)
+    pm_norm = jnp.sum(pooled_m * pooled_m, axis=1)
+    pm_dist2 = pm_norm[:, None] + pm_norm[None, :] - 2.0 * (pooled_m @ pooled_m.T)
+    pm_dist2 = jnp.maximum(pm_dist2, 0.0)
 
-    def loss(pred: jax.Array, target: jax.Array) -> jax.Array:
-        assert pred.shape == target.shape, (
-            f"pred and target must have the same shape, got {pred.shape} and {target.shape}"
-        )
-        ts_col: jax.Array | None = None
-        if time_augment:
-            assert int(pred.shape[-1]) == int(value_dim_int), (
-                f"Expected value dimension {int(value_dim_int)}, got {int(pred.shape[-1])}. "
-                "Pass the correct `ambient_dim` when constructing the loss."
-            )
-            length = int(pred.shape[-2])
-            ts = jnp.linspace(0.0, 1.0, length, dtype=pred.dtype)  # (T,)
-            ts_col = ts[:, None]  # (T, 1)
-        else:
-            assert int(pred.shape[-1]) == int(effective_dim), (
-                f"Expected path feature dimension {int(effective_dim)}, got {int(pred.shape[-1])}. "
-                "Pass the correct `ambient_dim` when constructing the loss."
-            )
+    eye = jnp.eye(int(pm_dist2.shape[0]), dtype=bool)
+    pm_dist2_no_diag = jnp.where(eye, jnp.nan, pm_dist2)
+    med = jnp.nanmedian(pm_dist2_no_diag)
+    med = jnp.where(jnp.isfinite(med) & (med > 0.0), med, 1.0)
+    med = jax.lax.stop_gradient(med)
+    denom = 2.0 * med + float(eps)
 
-        def _psi(path: jax.Array) -> jax.Array:
-            if time_augment:
-                assert ts_col is not None
-                if anchor_at_start:
-                    path = path - path[:1]
-                aug = jnp.concatenate([ts_col, path], axis=-1)  # (T, 1+value_dim)
-                if prepend_zero_basepoint:
-                    zero0 = jnp.zeros((1, effective_dim), dtype=aug.dtype)
-                    path = jnp.concatenate([zero0, aug], axis=0)
-                else:
-                    path = aug
+    def _k(a: jax.Array, b: jax.Array) -> jax.Array:
+        a_norm = jnp.sum(a * a, axis=1)
+        b_norm = jnp.sum(b * b, axis=1)
+        dist2 = a_norm[:, None] + b_norm[None, :] - 2.0 * (a @ b.T)
+        dist2 = jnp.maximum(dist2, 0.0)
+        return jnp.exp(-dist2 / denom)
 
-            sig = compute_path_signature(
-                path=path,
-                depth=depth,
-                hopf=hopf,
-                mode="full",
-            )
-            vec = sig.flatten()
-            if int(vec.shape[0]) != total_size:
-                raise ValueError(
-                    f"Unexpected signature feature length {int(vec.shape[0])}; expected {total_size}. "
-                    f"(depth={depth}, ambient_dim={effective_dim}, include_level0={include_level0})"
-                )
+    k_xx = _k(x, x)
+    k_yy = _k(y, y)
+    k_xy = _k(x, y)
+    return (jnp.mean(k_xx) + jnp.mean(k_yy) - 2.0 * jnp.mean(k_xy)).astype(
+        jnp.float32
+    )
 
-            parts = []
-            for idx, (a, b) in enumerate(slices):
-                parts.append(sqrt_weights[idx] * vec[a:b])
-            return jnp.concatenate(parts, axis=0)
 
-        psi_pred = jax.vmap(_psi)(pred)  # (N, F)
-        psi_target = jax.vmap(_psi)(target)  # (N, F) (same batch size enforced above)
+def ito_level2_distribution_mmd_loss(
+    *,
+    w_model: jax.Array,
+    x_model: jax.Array,
+    w_gt: jax.Array,
+    x_gt: jax.Array,
+    include_level1: bool = True,
+    max_bandwidth_points: int = 256,
+) -> jax.Array:
+    """Itô/branched level-2 distribution-matching loss for log-price paths.
 
-        mean_pred = jnp.mean(psi_pred, axis=0)
-        mean_target = jnp.mean(psi_target, axis=0)
+    Computes per-path level-1/2 features and matches them in distribution via an
+    RBF-kernel MMD^2.
+    """
+    feat_model = _ito_level12_feature_vectors(
+        w_paths=w_model, x_paths=x_model, include_level1=include_level1
+    )
+    feat_gt = _ito_level12_feature_vectors(
+        w_paths=w_gt, x_paths=x_gt, include_level1=include_level1
+    )
+    return _rbf_mmd2_median_heuristic(
+        feat_model, feat_gt, max_bandwidth_points=int(max_bandwidth_points)
+    )
 
-        diff = mean_pred - mean_target
-        return jnp.vdot(diff, diff)
 
-    return loss

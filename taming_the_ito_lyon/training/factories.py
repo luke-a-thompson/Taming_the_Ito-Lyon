@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 import optax
 from taming_the_ito_lyon.config import (
     Optimizer,
@@ -11,11 +12,12 @@ from taming_the_ito_lyon.config import (
 )
 from taming_the_ito_lyon.config.config_options import (
     LossType,
-    UnconditionalDriverKind,
     StepsizeControllerType,
     ManifoldType,
+    HopfAlgebraType,
 )
 from stochastax.manifolds import Manifold, EuclideanSpace, SO3
+from stochastax.manifolds.spd import SPDManifold
 from diffrax import ConstantStepSize, PIDController
 from taming_the_ito_lyon.models import (
     NeuralCDE,
@@ -52,7 +54,8 @@ def _maybe_create_extrapolation_scheme(
 
     # Only these models currently accept extrapolation parameters.
     if not isinstance(
-        config.nn_config, (NCDEConfig, LogNCDEConfig, MNRDEConfig, GRUConfig)
+        config.nn_config,
+        (NCDEConfig, LogNCDEConfig, NRDEConfig, MNRDEConfig, GRUConfig),
     ):
         return key, None
 
@@ -85,7 +88,7 @@ def create_manifold_from_type(
         case ManifoldType.SO3:
             return SO3
         case ManifoldType.SPD:
-            raise NotImplementedError("SPD manifold not implemented yet")
+            return SPDManifold
         case _:
             raise ValueError(f"Unknown manifold: {manifold_type}")
 
@@ -140,6 +143,7 @@ def create_model(
                 evolving_out=config.experiment_config.evolving_out,
                 extrapolation_scheme=extrapolation_scheme,
                 n_recon=config.experiment_config.n_recon,
+                control_interpolation=config.nn_config.control_interpolation,
             )
         case LogNCDEConfig():
             return LogNCDE(
@@ -169,9 +173,12 @@ def create_model(
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
                 stepsize_controller=stepsize_controller,
-                key=key,
+                extrapolation_scheme=extrapolation_scheme,
+                n_recon=config.experiment_config.n_recon,
+                key=model_key,
             )
         case MNRDEConfig():
+            brownian_channels = config.nn_config.brownian_channels
             return MNDRE(
                 input_path_dim=input_path_dim,
                 cde_state_dim=config.nn_config.cde_state_dim,
@@ -182,13 +189,14 @@ def create_model(
                 output_path_dim=output_path_dim,
                 signature_depth=config.nn_config.signature_depth,
                 signature_window_size=config.nn_config.signature_window_size,
-                signature_window_sizes=config.nn_config.signature_window_sizes,
                 data_manifold=manifold,
                 hidden_manifold=hidden_manifold,
                 hopf_algebra_type=config.nn_config.hopf_algebra,
                 stepsize_controller=stepsize_controller,
                 extrapolation_scheme=extrapolation_scheme,
                 n_recon=config.experiment_config.n_recon,
+                brownian_channels=brownian_channels,
+                brownian_corr=0.0,
                 key=model_key,
             )
         case GRUConfig():
@@ -259,21 +267,28 @@ def create_dataloaders(
     config: Config,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     match config.experiment_config.dataset_name:
-        case Datasets.BLACK_SCHOLES | Datasets.BERGOMI | Datasets.ROUGH_BERGOMI:
+        case (
+            Datasets.BLACK_SCHOLES
+            | Datasets.BERGOMI
+            | Datasets.ROUGH_BERGOMI
+            | Datasets.SIMPLE_RBERGOMI
+        ):
             from taming_the_ito_lyon.data.rough_volatility import RoughVolatilityDataset
+            from taming_the_ito_lyon.data.simple_rough_volatility import (
+                SimpleRoughVolatilityDataset,
+            )
 
-            train = RoughVolatilityDataset(
-                config=config,
-                split="train",
-            ).make_array_source()
-            val = RoughVolatilityDataset(
-                config=config,
-                split="val",
-            ).make_array_source()
-            test = RoughVolatilityDataset(
-                config=config,
-                split="test",
-            ).make_array_source()
+            dataset_cls: (
+                type[RoughVolatilityDataset] | type[SimpleRoughVolatilityDataset]
+            )
+            if config.experiment_config.dataset_name == Datasets.SIMPLE_RBERGOMI:
+                dataset_cls = SimpleRoughVolatilityDataset
+            else:
+                dataset_cls = RoughVolatilityDataset
+
+            train = dataset_cls(config=config, split="train").make_array_source()
+            val = dataset_cls(config=config, split="val").make_array_source()
+            test = dataset_cls(config=config, split="test").make_array_source()
         case Datasets.SG_SO3_SIMULATION:
             from taming_the_ito_lyon.data.so3_dynamics_sim import SO3DynamicsSim
 
@@ -289,6 +304,42 @@ def create_dataloaders(
                 config=config,
                 split="test",
             ).make_disk_source()
+        case (
+            Datasets.OXFORD_MULTIMOTION_STATIC
+            | Datasets.OXFORD_MULTIMOTION_TRANSLATIONAL
+            | Datasets.OXFORD_MULTIMOTION_UNCONSTRAINED
+        ):
+            from taming_the_ito_lyon.data.oxford_multimotion import (
+                OxfordMultimotionDataset,
+            )
+
+            train = OxfordMultimotionDataset(
+                config=config,
+                split="train",
+            ).make_disk_source()
+            val = OxfordMultimotionDataset(
+                config=config,
+                split="val",
+            ).make_disk_source()
+            test = OxfordMultimotionDataset(
+                config=config,
+                split="test",
+            ).make_disk_source()
+        case Datasets.SPD_COVARIANCE_SOLAR:
+            from taming_the_ito_lyon.data.spd_covariance import SPDCovarianceDataset
+
+            train = SPDCovarianceDataset(
+                config=config,
+                split="train",
+            ).make_array_source()
+            val = SPDCovarianceDataset(
+                config=config,
+                split="val",
+            ).make_array_source()
+            test = SPDCovarianceDataset(
+                config=config,
+                split="test",
+            ).make_array_source()
         case _:
             raise ValueError(
                 f"Unknown dataset name: {config.experiment_config.dataset_name}"
@@ -311,9 +362,8 @@ def create_dataloaders(
 
 def create_unconditional_control_sampler(
     *,
-    driver_kind: UnconditionalDriverKind,
     driver_dim: int,
-    hurst: float,
+    anchor_at_basepoint: bool = True,
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """
     Create an unconditional control sampler.
@@ -323,17 +373,14 @@ def create_unconditional_control_sampler(
     driver values on the same grid.
     """
     import jax.numpy as jnp
-    import jax.random as jr
     from stochastax.controls.drivers import (
         bm_driver,
-        fractional_bm_driver,
-        riemann_liouville_driver,
     )
 
     def with_time(ts: jax.Array, values: jax.Array) -> jax.Array:
         return jnp.concatenate([ts[:, None], values], axis=-1)
 
-    def anchor_at_basepoint(values: jax.Array) -> jax.Array:
+    def _anchor_at_basepoint(values: jax.Array) -> jax.Array:
         """Anchor the path at the origin without changing its length.
 
         Note: "basepoint augmentation" in the signature literature often means
@@ -349,37 +396,18 @@ def create_unconditional_control_sampler(
         if timesteps <= 0:
             raise ValueError(f"ts must have length >= 2, got {ts.shape[0]}")
 
-        if driver_kind == UnconditionalDriverKind.BM:
-            values = bm_driver(key, timesteps=timesteps, dim=driver_dim).path
-            values = anchor_at_basepoint(values)
-            return with_time(ts, values)
-
-        if driver_kind == UnconditionalDriverKind.FBM:
-            values = fractional_bm_driver(
-                key, timesteps=timesteps, dim=driver_dim, hurst=float(hurst)
-            ).path
-            values = anchor_at_basepoint(values)
-            return with_time(ts, values)
-
-        if driver_kind == UnconditionalDriverKind.RL:
-            bm_key, rl_key = jr.split(key, 2)
-            bm_path = bm_driver(bm_key, timesteps=timesteps, dim=driver_dim)
-            values = riemann_liouville_driver(
-                rl_key, timesteps=timesteps, hurst=float(hurst), bm_path=bm_path
-            ).path
-            values = anchor_at_basepoint(values)
-            return with_time(ts, values)
-
-        raise ValueError(f"Unknown driver_kind: {driver_kind}")
+        values = bm_driver(key, timesteps=timesteps, dim=int(driver_dim)).path
+        if anchor_at_basepoint:
+            values = _anchor_at_basepoint(values)
+        return with_time(ts, values)
 
     return sample
 
 
 def create_unconditional_control_sampler_batched(
     *,
-    driver_kind: UnconditionalDriverKind,
-    driver_dim: int,
-    hurst: float,
+    driver_dim: int = 1,
+    anchor_at_basepoint: bool = True,
 ) -> Callable[[jax.Array, jax.Array, int], jax.Array]:
     """
     Create a batched unconditional control sampler.
@@ -391,7 +419,8 @@ def create_unconditional_control_sampler_batched(
     import jax.random as jr
 
     single_sampler = create_unconditional_control_sampler(
-        driver_kind=driver_kind, driver_dim=driver_dim, hurst=hurst
+        driver_dim=driver_dim,
+        anchor_at_basepoint=anchor_at_basepoint,
     )
 
     def sample_batch(ts: jax.Array, key: jax.Array, batch_size: int) -> jax.Array:
@@ -408,8 +437,9 @@ def create_grad_batch_loss_fns(
     *,
     output_path_dim: int | None = None,
 ) -> tuple[
-    Callable[[Model, jax.Array, jax.Array], tuple[jax.Array, optax.Updates]],
-    Callable[[Model, jax.Array, jax.Array], jax.Array],
+    Callable[[Model, jax.Array, jax.Array, jax.Array], tuple[jax.Array, optax.Updates]],
+    Callable[[Model, jax.Array, jax.Array, jax.Array], jax.Array],
+    Callable[[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array],
 ]:
     """
     Create (grad_fn, batch_loss_fn) for training and evaluation.
@@ -424,7 +454,8 @@ def create_grad_batch_loss_fns(
         rotational_geodesic_loss,
         truncated_sig_loss_time_augmented,
         frobenius_loss,
-        weighted_truncated_signature_score,
+        ito_level2_distribution_mmd_loss,
+        _maybe_unvech_spd,
     )
 
     match config.experiment_config.loss:
@@ -452,30 +483,93 @@ def create_grad_batch_loss_fns(
                 anchor_at_start=False,
                 prepend_zero_basepoint=True,
             )
-        case LossType.SIGKER_WEIGHTED:
-            raise NotImplementedError("SIGKER_WEIGHTED loss not implemented yet")
-            # if output_path_dim is None:
-            #     raise ValueError(
-            #         "output_path_dim must be provided when loss_type is SIGKER so the "
-            #         "Hopf algebra can be constructed outside of jit."
-            #     )
-            # loss_fn = weighted_truncated_signature_score(
-            #     depth=4,
-            #     ambient_dim=int(output_path_dim),
-            # )
         case _:
             raise ValueError(f"Unknown loss type: {config.experiment_config.loss}")
+
+    use_spd = config.experiment_config.manifold == ManifoldType.SPD
+    if use_spd and config.experiment_config.loss == LossType.SIGKER:
+        raise ValueError(
+            "SIGKER loss expects vector-valued paths. For SPD outputs, use MSE or "
+            "FROBENIUS and enable SPD manifold output."
+        )
+
+    use_ito_mmd_loss = (
+        config.experiment_config.loss == LossType.SIGKER
+        and isinstance(config.nn_config, MNRDEConfig)
+        and config.nn_config.hopf_algebra == HopfAlgebraType.GL
+        and config.experiment_config.dataset_name == Datasets.SIMPLE_RBERGOMI
+    )
+    ito_weight = float(config.experiment_config.ito_level2_mmd_weight)
 
     def batch_loss_fn(
         model: Model,
         control_values_b: jax.Array,
         target_b: jax.Array,
+        gt_driver_b: jax.Array,
     ) -> jax.Array:
         preds = jax.vmap(model)(control_values_b)
-        loss = loss_fn(preds, target_b)
-        return loss
+        if use_spd:
+            preds = _maybe_unvech_spd(preds)
+            target_b = _maybe_unvech_spd(target_b)
+        base = loss_fn(preds, target_b)
 
-    return eqx.filter_value_and_grad(batch_loss_fn), batch_loss_fn
+        if not use_ito_mmd_loss or ito_weight <= 0.0:
+            return base
+
+        # W_model: latent Brownian channel from controls. In unconditional mode the
+        # control is (t, W), so time is channel 0 and must be excluded from
+        # quadratic variation.
+        w_model = control_values_b[..., 1] if int(control_values_b.shape[-1]) >= 2 else control_values_b[..., 0]
+
+        # W_gt: simulator Brownian driver from dataset (no time channel).
+        w_gt = gt_driver_b[..., 0]
+
+        # X_model/X_gt: log-price paths (channel 0).
+        x_model = preds[..., 0]
+        x_gt = target_b[..., 0]
+
+        ito_mmd = ito_level2_distribution_mmd_loss(
+            w_model=w_model,
+            x_model=x_model,
+            w_gt=w_gt,
+            x_gt=x_gt,
+            include_level1=True,
+            max_bandwidth_points=256,
+        )
+        return base + jnp.asarray(ito_weight, dtype=base.dtype) * ito_mmd
+
+    def loss_on_preds_fn(
+        preds: jax.Array,
+        target_b: jax.Array,
+        control_values_b: jax.Array,
+        gt_driver_b: jax.Array,
+    ) -> jax.Array:
+        if use_spd:
+            preds = _maybe_unvech_spd(preds)
+            target_b = _maybe_unvech_spd(target_b)
+        base = loss_fn(preds, target_b)
+        if not use_ito_mmd_loss or ito_weight <= 0.0:
+            return base
+
+        w_model = control_values_b[..., 1] if int(control_values_b.shape[-1]) >= 2 else control_values_b[..., 0]
+        w_gt = gt_driver_b[..., 0]
+        x_model = preds[..., 0]
+        x_gt = target_b[..., 0]
+        ito_mmd = ito_level2_distribution_mmd_loss(
+            w_model=w_model,
+            x_model=x_model,
+            w_gt=w_gt,
+            x_gt=x_gt,
+            include_level1=True,
+            max_bandwidth_points=256,
+        )
+        return base + jnp.asarray(ito_weight, dtype=base.dtype) * ito_mmd
+
+    return (
+        eqx.filter_value_and_grad(batch_loss_fn),
+        batch_loss_fn,
+        eqx.filter_jit(loss_on_preds_fn),
+    )
 
 
 def configure_jax() -> None:
@@ -500,7 +594,12 @@ def create_results_gathering_fn(
     config: Config,
 ) -> ResultsGatheringFn:
     match config.experiment_config.dataset_name:
-        case Datasets.BLACK_SCHOLES | Datasets.BERGOMI | Datasets.ROUGH_BERGOMI:
+        case (
+            Datasets.BLACK_SCHOLES
+            | Datasets.BERGOMI
+            | Datasets.ROUGH_BERGOMI
+            | Datasets.SIMPLE_RBERGOMI
+        ):
             from taming_the_ito_lyon.training.results_gathering_fns import (
                 get_rough_volatility_results,
             )
@@ -512,6 +611,22 @@ def create_results_gathering_fn(
             )
 
             return get_sg_so3_simulation_results
+        case (
+            Datasets.OXFORD_MULTIMOTION_STATIC
+            | Datasets.OXFORD_MULTIMOTION_TRANSLATIONAL
+            | Datasets.OXFORD_MULTIMOTION_UNCONSTRAINED
+        ):
+            from taming_the_ito_lyon.training.results_gathering_fns import (
+                get_sg_so3_simulation_results,
+            )
+
+            return get_sg_so3_simulation_results
+        case Datasets.SPD_COVARIANCE_SOLAR:
+            from taming_the_ito_lyon.training.results_gathering_fns import (
+                get_spd_covariance_results,
+            )
+
+            return get_spd_covariance_results
         case _:
             raise ValueError(
                 f"Unknown dataset name: {config.experiment_config.dataset_name}"

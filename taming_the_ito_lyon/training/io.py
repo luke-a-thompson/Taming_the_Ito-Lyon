@@ -118,9 +118,10 @@ def write_test_metrics(
     test_eval_metric: float,
     test_results_dict: ResultsDict,
     checkpoint_path: str,
+    metrics_name: str = "test_metrics.json",
 ) -> str:
     scaled_test, unit, scale = loss_meta(loss_label, test_eval_metric)
-    metrics_path = os.path.join(run_dir, "test_metrics.json")
+    metrics_path = os.path.join(run_dir, metrics_name)
     metrics = {
         "run": {
             "name": os.path.basename(run_dir),

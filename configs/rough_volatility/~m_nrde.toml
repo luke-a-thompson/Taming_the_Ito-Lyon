@@ -1,10 +1,10 @@
 [experiment_config]
-model_type = "log_ncde"
+model_type = "mnrde"
 dataset_name = "rough_bergomi"
 
 # Optimizer
 optimizer = "adamw"
-learning_rate = 3e-4
+learning_rate = 1e-4
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
@@ -12,7 +12,7 @@ max_grad_norm = 1.0
 loss = "sigker"
 seed = 1
 batch_size = 1024
-epochs = 200
+epochs = 100
 
 # Training mode
 training_mode = "unconditional"
@@ -28,10 +28,10 @@ rtol = 1e-3
 atol = 1e-3
 dtmin = 1e-4
 
-[log_ncde_config]
+[mnrde_config]
 
-# Log-NCDE model parameters
-cde_state_dim = 32         # Jacobian burden, quadratic in this
+# M-NRDE model parameters
+cde_state_dim = 32
 init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
@@ -41,3 +41,6 @@ out_size = 1
 # Log-signature configuration
 signature_depth = 2
 signature_window_size = 16
+
+hopf_algebra = "gl"
+brownian_channels = [2]

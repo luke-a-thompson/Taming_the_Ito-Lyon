@@ -7,13 +7,25 @@ import numpy as np
 from typing import Literal
 from cyreal.datasets.time_utils import make_sequence_disk_source
 from taming_the_ito_lyon.config import Config
-from taming_the_ito_lyon.config.config_options import Datasets
 from cyreal.sources import ArraySource, DiskSource
 from dataclasses import field
 
 
 @dataclass
-class RoughVolatilityDataset(DatasetProtocol):
+class SimpleRoughVolatilityDataset(DatasetProtocol):
+    """Dataset wrapper for `simple_rbergomi_data.npz`.
+
+    The `.npz` file contains:
+    - driver: (B, T, 1)
+    - price: (B, T)
+    - log_price: (B, T)
+    - variance: (B, T)
+    - dt: scalar
+
+    This loader exposes a `(B, T, 1)` `solution` by using **log_price** as the
+    target.
+    """
+
     config: Config
     split: Literal["train", "val", "test"]
     ordering: Literal["sequential", "shuffle"] = field(init=False)
@@ -23,19 +35,12 @@ class RoughVolatilityDataset(DatasetProtocol):
 
         data = np.load(self.config.experiment_config.dataset_name.value)
         driver = np.asarray(data["driver"], dtype=np.float32)
-        solution = np.asarray(data["solution"], dtype=np.float32)
-
-        # For rough-volatility datasets the .npz contains multiple channels, but the
-        # training pipeline is set up to learn a single target channel (e.g. price).
-        # Keep only the first channel for both driver and solution to match the
-        # behavior in `taming_the_ito_lyon.data.datasets.prepare_dataset`.
-        if self.config.experiment_config.dataset_name in (
-            Datasets.BLACK_SCHOLES,
-            Datasets.BERGOMI,
-            Datasets.ROUGH_BERGOMI,
-        ):
-            driver = driver[..., 0:1]
-            solution = solution[..., 0:1]
+        log_price = np.asarray(data["log_price"], dtype=np.float32)
+        if log_price.ndim != 2:
+            raise ValueError(
+                f"Expected 'log_price' shaped (num_examples, T), got {log_price.shape}"
+            )
+        solution = log_price[..., None]  # (B, T, 1)
 
         if driver.shape != solution.shape:
             raise ValueError(
@@ -78,14 +83,14 @@ class RoughVolatilityDataset(DatasetProtocol):
         return {"driver": self._driver, "solution": self._solution}
 
     def make_array_source(self) -> ArraySource:
-        dataset = RoughVolatilityDataset(config=self.config, split=self.split)
+        dataset = SimpleRoughVolatilityDataset(config=self.config, split=self.split)
         array_source = ArraySource(dataset.as_array_dict(), ordering=self.ordering)
         return array_source
 
     def make_disk_source(
         self,
     ) -> DiskSource:
-        dataset = RoughVolatilityDataset(config=self.config, split=self.split)
+        dataset = SimpleRoughVolatilityDataset(config=self.config, split=self.split)
         disk_source = make_sequence_disk_source(
             contexts=np.asarray(dataset._driver),
             targets=np.asarray(dataset._solution),
@@ -131,7 +136,7 @@ def _select_example_split(
 if __name__ == "__main__":
     from taming_the_ito_lyon.config.config import load_toml_config
 
-    config = load_toml_config("configs/rough_volatility/~m_nrde.toml")
-    dataset = RoughVolatilityDataset(config, "train")
+    config = load_toml_config("configs/rough_volatility_simple/~m_nrde.toml")
+    dataset = SimpleRoughVolatilityDataset(config, "train")
     print(dataset._driver.shape)
     print(dataset._solution.shape)

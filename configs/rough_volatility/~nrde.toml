@@ -1,5 +1,5 @@
 [experiment_config]
-model_type = "mnrde"
+model_type = "nrde"
 dataset_name = "rough_bergomi"
 
 # Optimizer
@@ -16,9 +16,7 @@ epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-unconditional_driver_kind = "rl" # "bm" | "fbm" | "rl"
-unconditional_driver_dim = 1     # number of non-time channels
-unconditional_hurst = 0.33        # used for "fbm"/"rl"
+# Unconditional generation samples a Brownian motion with this many channels.
 
 manifold = "euclidean"
 hidden_manifold = "euclidean"
@@ -30,9 +28,9 @@ rtol = 1e-3
 atol = 1e-3
 dtmin = 1e-4
 
-[mnrde_config]
+[nrde_config]
 
-# M-NRDE model parameters
+# NRDE model parameters
 cde_state_dim = 32
 init_hidden_dim = 32
 vf_hidden_dim = 32
@@ -42,9 +40,4 @@ out_size = 1
 
 # Log-signature configuration
 signature_depth = 2
-
-# Multi-window drive (all must divide T-1=512 for rough_bergomi in this repo)
-signature_window_sizes = [16, 64, 128]
-
-hopf_algebra = "gl"
-
+signature_window_size = 16

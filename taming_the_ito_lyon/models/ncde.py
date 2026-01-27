@@ -13,6 +13,7 @@ import diffrax
 from typing import Callable
 
 from stochastax.manifolds import Manifold
+from stochastax.manifolds.spd import SPDManifold
 from .extrapolation import ExtrapolationScheme
 
 
@@ -47,7 +48,7 @@ class CDEFunc(eqx.Module):
             width_size=vf_hidden_dim,
             depth=vf_mlp_depth,
             activation=jnn.softplus,
-            final_activation=jnn.tanh,
+            final_activation=lambda x: x,
             key=key,
         )
 
@@ -75,6 +76,7 @@ class NeuralCDE(eqx.Module):
     manifold: type[Manifold] = eqx.field(static=True)
     readout_activation: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
+    control_interpolation: str = eqx.field(static=True)
 
     # Extrapolation scheme
     extrapolation_scheme: ExtrapolationScheme | None = eqx.field(static=True)
@@ -104,6 +106,7 @@ class NeuralCDE(eqx.Module):
         readout_activation: Callable[[jax.Array], jax.Array] = lambda x: x,
         extrapolation_scheme: ExtrapolationScheme | None = None,
         n_recon: int | None = None,
+        control_interpolation: str = "hermite_cubic",
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
 
@@ -138,6 +141,7 @@ class NeuralCDE(eqx.Module):
         self.evolving_out = evolving_out
         self.manifold = manifold
         self.readout_activation = readout_activation
+        self.control_interpolation = control_interpolation
 
         # Solver configuration
         self.solver = solver
@@ -149,8 +153,10 @@ class NeuralCDE(eqx.Module):
 
         def apply_single(y: jax.Array) -> jax.Array:
             activation = self.readout_activation(self.readout_layer(y))
-            rotmat = self.manifold.retract(activation)
-            return rotmat
+            if issubclass(self.manifold, SPDManifold):
+                matrix = SPDManifold.unvech(activation)
+                return SPDManifold.retract(matrix)
+            return self.manifold.retract(activation)
 
         return jax.vmap(apply_single)(hidden_states)
 
@@ -212,9 +218,18 @@ class NeuralCDE(eqx.Module):
 
             return outputs
         else:
-            # Standard mode: build interpolation directly from raw values.
-            coeffs = diffrax.backward_hermite_coefficients(ts=ts, ys=control_values)
-            control = diffrax.CubicInterpolation(ts, coeffs)
+            if self.control_interpolation == "hermite_cubic":
+                coeffs = diffrax.backward_hermite_coefficients(
+                    ts=ts, ys=control_values
+                )
+                control = diffrax.CubicInterpolation(ts, coeffs)
+            elif self.control_interpolation == "linear":
+                control = diffrax.LinearInterpolation(ts, control_values)
+            else:
+                raise ValueError(
+                    f"Unknown control_interpolation={self.control_interpolation!r}. "
+                    "Expected 'hermite_cubic' or 'linear'."
+                )
             hidden = self._forward_with_control(ts, control)
 
             if self.evolving_out:
@@ -222,4 +237,7 @@ class NeuralCDE(eqx.Module):
 
             # Single output case: also convert from 6D to 3x3
             final_output = self.readout_activation(self.readout_layer(hidden[-1]))
+            if issubclass(self.manifold, SPDManifold):
+                matrix = SPDManifold.unvech(final_output)
+                return SPDManifold.retract(matrix)
             return self.manifold.retract(final_output)

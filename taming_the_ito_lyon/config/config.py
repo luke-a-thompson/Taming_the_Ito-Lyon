@@ -18,9 +18,9 @@ from taming_the_ito_lyon.config.config_options import (
     LossType,
     HopfAlgebraType,
     TrainingMode,
-    UnconditionalDriverKind,
     ManifoldType,
     StepsizeControllerType,
+    ControlInterpolationType,
 )
 
 
@@ -85,12 +85,13 @@ class ExperimentConfig(BaseModel):
             if self.model_type not in (
                 ModelType.NCDE,
                 ModelType.LOG_NCDE,
+                ModelType.NRDE,
                 ModelType.MNRDE,
                 ModelType.GRU,
             ):
                 raise ValueError(
                     "extrapolation_scheme is only supported for model_type in "
-                    "{ncde, log_ncde, mnrde, gru}."
+                    "{ncde, log_ncde, nrde, mnrde, gru}."
                 )
         return self
 
@@ -116,6 +117,15 @@ class ExperimentConfig(BaseModel):
         default=25, description="Epochs with no val improvement before stopping"
     )
 
+    ito_level2_mmd_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Weight for the Itô / branched level-2 distribution-matching MMD loss "
+            "(only applied for SIMPLE_RBERGOMI when model_type='mnrde' and hopf_algebra='gl')."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_early_stopping_patience(self) -> ExperimentConfig:
         if self.early_stopping_patience > self.epochs:
@@ -137,19 +147,6 @@ class ExperimentConfig(BaseModel):
         default=TrainingMode.CONDITIONAL,
         description="Training mode: 'conditional' uses dataset controls; 'unconditional' samples a driver internally.",
     )
-    unconditional_driver_kind: UnconditionalDriverKind | None = Field(
-        default=None,
-        description="Unconditional driver kind: bm / fbm / rl (Riemann-Liouville / rough).",
-    )
-    unconditional_driver_dim: PositiveInt | None = Field(
-        default=None,
-        description="Number of non-time driver channels for unconditional mode. The model input dim becomes (unconditional_driver_dim + 1) to include time.",
-    )
-    unconditional_hurst: PositiveFloat | None = Field(
-        default=None,
-        le=1.0,
-        description="Hurst parameter used when unconditional_driver_kind is 'rl'.",
-    )
 
     # Performance / logging
     tqdm_update_interval: PositiveInt = Field(
@@ -169,60 +166,18 @@ class ExperimentConfig(BaseModel):
                     Datasets.BLACK_SCHOLES,
                     Datasets.BERGOMI,
                     Datasets.ROUGH_BERGOMI,
+                    Datasets.SIMPLE_RBERGOMI,
                 ):
                     raise ValueError(
                         "Rough volatility datasets do not support conditional training"
                     )
-                if (
-                    self.unconditional_driver_kind is not None
-                    or self.unconditional_driver_dim is not None
-                    or self.unconditional_hurst is not None
-                ):
-                    raise ValueError(
-                        "unconditional_driver_kind, unconditional_driver_dim, and unconditional_hurst must be None when training_mode='conditional'"
-                    )
             case TrainingMode.UNCONDITIONAL:
-                if (
-                    self.unconditional_driver_kind is None
-                    or self.unconditional_driver_dim is None
-                    or self.unconditional_hurst is None
-                ):
-                    raise ValueError(
-                        "unconditional_driver_kind, unconditional_driver_dim, and unconditional_hurst must be set when training_mode='unconditional'"
-                    )
                 if self.extrapolation_scheme is not None:
                     raise ValueError(
                         "extrapolation_scheme must be None when training_mode='unconditional'"
                     )
             case _:
                 raise ValueError(f"Unknown training mode: {self.training_mode}")
-        return self
-
-    @model_validator(mode="after")
-    def validate_unconditional_driver_kind(self) -> ExperimentConfig:
-        # Only validate driver hyperparameters when unconditional mode is active.
-        if self.training_mode != TrainingMode.UNCONDITIONAL:
-            return self
-        if self.unconditional_driver_kind is None or self.unconditional_hurst is None:
-            return self
-
-        if (
-            self.unconditional_driver_kind == UnconditionalDriverKind.BM
-            and self.unconditional_hurst != 0.5
-        ):
-            raise ValueError(
-                f"Hurst parameter (currently {self.unconditional_hurst}) must be 0.5 for Brownian motion driver"
-            )
-        if self.unconditional_driver_kind in (
-            UnconditionalDriverKind.FBM,
-            UnconditionalDriverKind.RL,
-        ):
-            hurst = float(self.unconditional_hurst)
-            if not (0.0 < hurst < 1.0):
-                raise ValueError(
-                    f"Hurst parameter must be in (0, 1) for driver_kind='{self.unconditional_driver_kind}' "
-                    f"(got {hurst})"
-                )
         return self
 
 
@@ -270,6 +225,10 @@ class NCDEConfig(BaseModel):
     )
     cde_state_dim: PositiveInt = Field(description="CDE hidden state dimension")
     out_size: PositiveInt = Field(description="Output channels predicted by readout")
+    control_interpolation: ControlInterpolationType = Field(
+        default=ControlInterpolationType.HERMITE_CUBIC,
+        description="Interpolation scheme used for the control path",
+    )
 
 
 class NRDEConfig(BaseModel):
@@ -325,18 +284,18 @@ class MNRDEConfig(BaseModel):
         default=1, description="Data steps per log-signature window"
     )
 
-    # Optional multi-window variant: compute log-signatures on multiple window sizes
-    # and drive a sum of CDE terms, one per window size.
-    signature_window_sizes: list[int] | None = Field(
-        default=None,
-        description=(
-            "Optional list of disjoint log-signature window sizes. If provided, "
-            "overrides signature_window_size and uses a multi-window MNRDE drive."
-        ),
-    )
-
     # Hopf algebra for M-NRDE
     hopf_algebra: HopfAlgebraType = Field(description="Hopf algebra to use")
+
+    # Optional: which control channels (including time) are Brownian for Itô cov.
+    # Example: for (t, W, Z) use [1, 2]; for (t, RL, Z) use [2].
+    brownian_channels: list[int] | None = Field(
+        default=None,
+        description=(
+            "Indices of Brownian channels in the control (including time at index 0). "
+            "If None, all non-time channels are treated as Brownian."
+        ),
+    )
 
 
 class LogNCDEConfig(BaseModel):

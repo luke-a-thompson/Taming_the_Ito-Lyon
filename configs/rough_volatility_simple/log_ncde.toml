@@ -1,6 +1,6 @@
 [experiment_config]
 model_type = "log_ncde"
-dataset_name = "rough_bergomi"
+dataset_name = "simple_rbergomi"
 
 # Optimizer
 optimizer = "adamw"
@@ -10,7 +10,7 @@ max_grad_norm = 1.0
 
 # Training
 loss = "sigker"
-seed = 1
+seed = 2
 batch_size = 1024
 epochs = 200
 
@@ -22,6 +22,7 @@ manifold = "euclidean"
 hidden_manifold = "euclidean"
 evolving_out = true
 
+early_stopping_patience = 15
 [solver_config]
 stepsize_controller = "pid"
 rtol = 1e-3

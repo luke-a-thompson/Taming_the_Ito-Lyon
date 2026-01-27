@@ -23,14 +23,15 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-stochastax = { git = "https://github.com/luke-a-thompson/Stochastax.git", branch = "master" }
-
+stochastax = { git = "https://github.com/luke-a-thompson/Stochastax.git", branch = "ArbitraryDepthBranchedRP" }
 cyreal = { git = "https://github.com/luke-a-thompson/cyreal_dynamics.git", branch = "master" }
 
 [project.scripts]
 train = "taming_the_ito_lyon.training.train_cli:main"
 test = "taming_the_ito_lyon.training.test_cli:main"
 optimize = "taming_the_ito_lyon.training.optimize_cli:main"
+tables = "taming_the_ito_lyon.paper.tables_cli:main"
+shapes = "taming_the_ito_lyon.data.shapes_cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -4,22 +4,19 @@ dataset_name = "rough_bergomi"
 
 # Optimizer
 optimizer = "adamw"
-learning_rate = 1e-4
+learning_rate = 3e-4
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
 loss = "sigker"
 seed = 1
-batch_size = 2048
+batch_size = 1024
 epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-# To run unconditional generation, switch training_mode and set:
-unconditional_driver_kind = "bm" # "bm" | "fbm" | "rl"
-unconditional_driver_dim = 1     # number of non-time channels
-unconditional_hurst = 0.5        # used for "fbm"/"rl" (must be 0.5 for "bm")
+# Unconditional generation samples a Brownian motion with this many channels.
 
 manifold = "euclidean"
 hidden_manifold = "euclidean"
@@ -27,16 +24,17 @@ evolving_out = true
 
 [solver_config]
 stepsize_controller = "pid"
-rtol = 1e-2
+rtol = 1e-3
 atol = 1e-3
 dtmin = 1e-4
 
 [ncde_config]
 
 # NCDE model parameters
-cde_state_dim = 16
+cde_state_dim = 32
 init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 3
 out_size = 1
+control_interpolation = "hermite_cubic" # "hermite_cubic" | "linear"

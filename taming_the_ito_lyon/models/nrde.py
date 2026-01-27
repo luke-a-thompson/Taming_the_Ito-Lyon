@@ -14,6 +14,7 @@ from stochastax.hopf_algebras import ShuffleHopfAlgebra
 from .logsignatures import (
     compute_windowed_logsignatures_from_values,
 )
+from .extrapolation import ExtrapolationScheme
 from .logsig_cde_solve import solve_cde_from_windowed_logsigs
 
 
@@ -83,6 +84,10 @@ class NeuralRDE(eqx.Module):
     signature_window_size: int = eqx.field(static=True)
     evolving_out: bool = eqx.field(static=True)
 
+    # Extrapolation scheme
+    extrapolation_scheme: ExtrapolationScheme | None = eqx.field(static=True)
+    n_recon: int | None = eqx.field(static=True)
+
     # Solver configuration (matches NeuralCDE pattern)
     solver: diffrax.AbstractAdaptiveSolver = eqx.field(static=True)
     stepsize_controller: diffrax.AbstractStepSizeController = eqx.field(static=True)
@@ -106,6 +111,8 @@ class NeuralRDE(eqx.Module):
         stepsize_controller: diffrax.AbstractStepSizeController,
         dt0: float | None = None,
         evolving_out: bool = True,
+        extrapolation_scheme: ExtrapolationScheme | None = None,
+        n_recon: int | None = None,
     ) -> None:
         k1, k2, k3 = jr.split(key, 3)
         self.shuffle_hopf_algebra = ShuffleHopfAlgebra.build(
@@ -138,6 +145,8 @@ class NeuralRDE(eqx.Module):
         self.signature_depth = signature_depth
         self.signature_window_size = signature_window_size
         self.evolving_out = evolving_out
+        self.extrapolation_scheme = extrapolation_scheme
+        self.n_recon = n_recon
 
         self.solver = solver
         self.stepsize_controller = stepsize_controller
@@ -172,6 +181,23 @@ class NeuralRDE(eqx.Module):
             dt0=self.dt0,
         )
 
+    def _forward_with_control(
+        self,
+        ts: jax.Array,
+        control: diffrax.AbstractPath,
+    ) -> jax.Array:
+        control_values = jax.vmap(control.evaluate)(ts)
+        return self._forward_with_values(ts, control_values)
+
+    def _apply_readout(self, hidden_states: jax.Array) -> jax.Array:
+        """Apply readout to hidden states, reshaping 9D outputs to (3, 3)."""
+
+        def apply_single(y: jax.Array) -> jax.Array:
+            activation = self.readout_activation(self.readout_layer(y))
+            return jnp.reshape(activation, (3, 3))
+
+        return jax.vmap(apply_single)(hidden_states)
+
     def __call__(
         self,
         control_values: jax.Array,
@@ -190,13 +216,21 @@ class NeuralRDE(eqx.Module):
         """
         length = control_values.shape[0]
         ts = jnp.linspace(0.0, 1.0, length, dtype=control_values.dtype)  # (T,)
-        hidden_over_time = self._forward_with_values(ts, control_values)
+        if self.extrapolation_scheme is not None:
+            assert self.n_recon is not None, (
+                "n_recon must be set when using extrapolation_scheme"
+            )
+            control, _ = self.extrapolation_scheme.create_control(
+                ts, control_values, self.n_recon
+            )
+            hidden_over_time = self._forward_with_control(ts, control)
+        else:
+            hidden_over_time = self._forward_with_values(ts, control_values)
 
         if self.evolving_out:
-
-            def apply_readout(y: jax.Array) -> jax.Array:
-                return self.readout_activation(self.readout_layer(y))
-
-            return jax.vmap(apply_readout)(hidden_over_time)
+            return self._apply_readout(hidden_over_time)
         else:
-            return self.readout_activation(self.readout_layer(hidden_over_time[-1]))
+            final_output = self.readout_activation(
+                self.readout_layer(hidden_over_time[-1])
+            )
+            return jnp.reshape(final_output, (3, 3))

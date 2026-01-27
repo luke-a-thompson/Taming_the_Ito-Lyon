@@ -1,24 +1,24 @@
 [experiment_config]
-model_type = "log_ncde"
-dataset_name = "rough_bergomi"
+model_type = "mnrde"
+dataset_name = "spd_covariance_solar"
 
 # Optimizer
 optimizer = "adamw"
-learning_rate = 3e-4
+learning_rate = 1e-4
 weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
 loss = "sigker"
 seed = 1
-batch_size = 1024
-epochs = 200
+batch_size = 16
+epochs = 100
 
 # Training mode
 training_mode = "unconditional"
 # Unconditional generation samples a Brownian motion with this many channels.
 
-manifold = "euclidean"
+manifold = "spd"
 hidden_manifold = "euclidean"
 evolving_out = true
 
@@ -28,10 +28,10 @@ rtol = 1e-3
 atol = 1e-3
 dtmin = 1e-4
 
-[log_ncde_config]
+[mnrde_config]
 
-# Log-NCDE model parameters
-cde_state_dim = 32         # Jacobian burden, quadratic in this
+# M-NRDE model parameters
+cde_state_dim = 32
 init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
@@ -41,3 +41,5 @@ out_size = 1
 # Log-signature configuration
 signature_depth = 2
 signature_window_size = 16
+
+hopf_algebra = "mkw"

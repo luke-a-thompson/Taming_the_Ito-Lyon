@@ -8,7 +8,6 @@ import equinox as eqx
 import jax
 import jax.random as jr
 import optax
-import jax.numpy as jnp
 from tqdm.auto import tqdm
 
 from taming_the_ito_lyon.config import Config, load_toml_config
@@ -66,14 +65,18 @@ def experiment(
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
-    @eqx.filter_jit(donate="all")
+    # NOTE: Avoid buffer donation here. With our dataloader + warmup flow we may
+    # otherwise hit "Buffer has been deleted or donated" errors when arrays are
+    # (re)used across steps.
+    @eqx.filter_jit
     def train_step(
         control_values_b: jax.Array,
         target_b: jax.Array,
+        gt_driver_b: jax.Array,
         model: Model,
         opt_state: optax.OptState,
     ) -> tuple[jax.Array, Model, optax.OptState]:
-        loss_value, grads = runtime.grad_fn(model, control_values_b, target_b)
+        loss_value, grads = runtime.grad_fn(model, control_values_b, target_b, gt_driver_b)
         params = eqx.filter(model, eqx.is_inexact_array)
         updates, new_opt_state = optim.update(grads, opt_state, params)
         updated_model: Model = eqx.apply_updates(model, updates)
@@ -111,12 +114,41 @@ def experiment(
     patience = int(config.experiment_config.early_stopping_patience)
 
     epochs = int(config.experiment_config.epochs)
-    training_start = time.perf_counter()
     final_epoch = 0
 
     train_loader_state = runtime.train_loader_state
     val_loader_state = runtime.val_loader_state
     test_loader_state = runtime.test_loader_state
+
+    # Warm up JITs to exclude compile time from training timer.
+    warmup_batch, _, _ = runtime.train_iterate(train_loader_state)
+    if runtime.mode == TrainingMode.UNCONDITIONAL:
+        if runtime.unconditional_control_sampler is None:
+            raise ValueError("unconditional_control_sampler required for UNCONDITIONAL")
+        warmup_key = jr.PRNGKey(config.experiment_config.seed + 12345)
+        warmup_controls = runtime.unconditional_control_sampler(
+            runtime.ts_full, warmup_key, runtime.batch_size
+        )
+    else:
+        warmup_controls = warmup_batch["driver"]
+
+    warmup_preds = runtime.predict_batch(warmup_controls, model)
+    warmup_eval = runtime.loss_on_preds_fn(
+        warmup_preds, warmup_batch["solution"], warmup_controls, warmup_batch["driver"]
+    )
+    jax.block_until_ready(warmup_eval)
+
+    # Warm up the (JIT-compiled) training step as well.
+    warmup_loss, _, _ = train_step(
+        warmup_controls,
+        warmup_batch["solution"],
+        warmup_batch["driver"],
+        model,
+        opt_state,
+    )
+    jax.block_until_ready(warmup_loss)
+
+    training_start = time.perf_counter()
 
     epoch_bar = tqdm(
         range(epochs),
@@ -247,6 +279,7 @@ def run_test(
     config: Config,
     checkpoint_path: str,
     run_dir: str | None = None,
+    metrics_name: str = "test_metrics.json",
 ) -> None:
     configure_jax()
     model_name = config.experiment_config.model_type.value
@@ -304,6 +337,7 @@ def run_test(
             test_eval_metric=test_eval_metric,
             test_results_dict=test_results_dict,
             checkpoint_path=checkpoint_path,
+            metrics_name=metrics_name,
         )
 
     tqdm.write(
