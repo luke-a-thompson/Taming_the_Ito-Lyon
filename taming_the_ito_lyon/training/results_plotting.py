@@ -36,7 +36,7 @@ def save_rough_volatility_two_panel_plot(
     left_color: str = "black",
     right_color: str = "red",
     alpha: float = 0.5,
-    figsize: tuple[float, float] = (10.0, 4.0),
+    figsize: tuple[float, float] = (8.0, 4.0),
 ) -> None:
     left_bt = _as_btc_first_channel(left)
     right_bt = _as_btc_first_channel(right)
@@ -54,6 +54,92 @@ def save_rough_volatility_two_panel_plot(
 
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     fig.savefig(out_file)
+    plt.close(fig)
+
+
+def save_rough_volatility_fan_plot(
+    *,
+    targets: np.ndarray,
+    preds: np.ndarray,
+    out_file: str,
+    max_paths: int | None = None,
+    figsize: tuple[float, float] = (10.0, 4.0),
+    targets_label: str = "Targets",
+    preds_label: str = "Preds",
+    quantiles: tuple[float, float, float, float] = (0.1, 0.25, 0.75, 0.9),
+    alpha_outer: float = 0.18,
+    alpha_inner: float = 0.35,
+    targets_color: str = "0.25",
+    preds_color: str = "tab:orange",
+) -> None:
+    """Fan plot of rough-vol distributions over time (targets vs preds)."""
+    targets_bt = _as_btc_first_channel(np.asarray(targets))
+    preds_bt = _as_btc_first_channel(np.asarray(preds))
+    if targets_bt.shape != preds_bt.shape:
+        raise ValueError(
+            f"targets and preds must have same shape, got {targets_bt.shape} and {preds_bt.shape}"
+        )
+    b = int(targets_bt.shape[0])
+    t = int(targets_bt.shape[1])
+    if b <= 0 or t <= 0:
+        return
+    if max_paths is not None:
+        b_use = min(int(max_paths), b)
+        targets_bt = targets_bt[:b_use]
+        preds_bt = preds_bt[:b_use]
+
+    q_low, q_inner_low, q_inner_high, q_high = quantiles
+    time_idx = np.arange(int(targets_bt.shape[1]))
+
+    t_q_low = np.quantile(targets_bt, q_low, axis=0)
+    t_q_inner_low = np.quantile(targets_bt, q_inner_low, axis=0)
+    t_q_inner_high = np.quantile(targets_bt, q_inner_high, axis=0)
+    t_q_high = np.quantile(targets_bt, q_high, axis=0)
+    t_med = np.quantile(targets_bt, 0.5, axis=0)
+
+    p_q_low = np.quantile(preds_bt, q_low, axis=0)
+    p_q_inner_low = np.quantile(preds_bt, q_inner_low, axis=0)
+    p_q_inner_high = np.quantile(preds_bt, q_inner_high, axis=0)
+    p_q_high = np.quantile(preds_bt, q_high, axis=0)
+    p_med = np.quantile(preds_bt, 0.5, axis=0)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize, sharex=True, sharey=True)
+    ax.fill_between(
+        time_idx, t_q_low, t_q_high, color=targets_color, alpha=float(alpha_outer)
+    )
+    ax.fill_between(
+        time_idx,
+        t_q_inner_low,
+        t_q_inner_high,
+        color=targets_color,
+        alpha=float(alpha_inner),
+    )
+    ax.plot(time_idx, t_med, color=targets_color, linewidth=1.5, label=targets_label)
+
+    ax.fill_between(
+        time_idx, p_q_low, p_q_high, color=preds_color, alpha=float(alpha_outer)
+    )
+    ax.fill_between(
+        time_idx,
+        p_q_inner_low,
+        p_q_inner_high,
+        color=preds_color,
+        alpha=float(alpha_inner),
+    )
+    ax.plot(time_idx, p_med, color=preds_color, linewidth=1.5, label=preds_label)
+
+    ax.set_xlabel("time index", fontsize=16)
+    ax.set_ylabel("log-price", fontsize=16)
+    ax.legend(loc="best", frameon=False, fontsize=16)
+    ax.tick_params(axis="both", labelsize=16)
+    fig.tight_layout()
+
+    base, _ = os.path.splitext(out_file)
+    out_dir = os.path.dirname(base) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(f"{base}.pdf")
+    fig.savefig(f"{base}.svg")
+    fig.savefig(f"{base}.png")
     plt.close(fig)
 
 
@@ -140,6 +226,54 @@ def save_spd_covariance_eigenvalue_trajectory_plot(
     ax_p.set_xlabel("time index")
     ax_t.set_ylabel("eigenvalue")
     ax_t.legend(loc="best", frameon=False)
+    fig.tight_layout()
+
+    base, _ = os.path.splitext(out_file)
+    out_file = f"{base}.pdf"
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+    fig.savefig(out_file)
+    plt.close(fig)
+
+
+def save_spd_covariance_eigenvalue_trajectory_single_plot(
+    *,
+    paths: np.ndarray,
+    out_file: str,
+    n_plot: int = 4,
+    figsize: tuple[float, float] = (8.0, 4.0),
+    title: str = "Targets (eigenvalues)",
+    alpha: float = 0.6,
+) -> None:
+    """Plot eigenvalue trajectories for a single set of SPD paths."""
+    mats = _to_spd_matrix_paths(paths)  # (B,T,3,3)
+    if mats.ndim != 4 or mats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (B,T,3,3), got {mats.shape}")
+
+    b = int(mats.shape[0])
+    t = int(mats.shape[1])
+    n_plot0 = min(int(n_plot), b)
+    if n_plot0 <= 0 or t <= 0:
+        return
+
+    mats = 0.5 * (mats + np.swapaxes(mats, -1, -2))
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize, sharex=True, sharey=True)
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+    labels = [r"$\lambda_1$", r"$\lambda_2$", r"$\lambda_3$"]
+    for i in range(n_plot0):
+        eig = np.linalg.eigvalsh(mats[i])  # (T,3)
+        for k in range(3):
+            ax.plot(
+                eig[:, k],
+                color=colors[k],
+                alpha=float(alpha),
+                linewidth=1.25,
+                label=labels[k] if i == 0 else None,
+            )
+    ax.set_title(title)
+    ax.set_xlabel("time index")
+    ax.set_ylabel("eigenvalue")
+    ax.legend(loc="best", frameon=False)
     fig.tight_layout()
 
     base, _ = os.path.splitext(out_file)
@@ -257,6 +391,77 @@ def save_spd_covariance_eigenvalue_fan_plot(
     ax_p.set_xlabel("time index")
     ax_t.set_ylabel("eigenvalue")
     ax_t.legend(loc="best", frameon=False)
+    fig.tight_layout()
+
+    base, _ = os.path.splitext(out_file)
+    out_file = f"{base}.pdf"
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+    fig.savefig(out_file)
+    plt.close(fig)
+
+
+def save_spd_covariance_eigenvalue_fan_single_plot(
+    *,
+    paths: np.ndarray,
+    out_file: str,
+    max_paths: int | None = None,
+    figsize: tuple[float, float] = (8.0, 4.0),
+    title: str = "Targets (eigenvalues)",
+    quantiles: tuple[float, float, float, float] = (0.1, 0.25, 0.75, 0.9),
+    alpha_outer: float = 0.18,
+    alpha_inner: float = 0.35,
+) -> None:
+    """Fan plot of eigenvalue distributions for a single SPD batch."""
+    mats = _to_spd_matrix_paths(paths)  # (B,T,3,3)
+    if mats.ndim != 4 or mats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (B,T,3,3), got {mats.shape}")
+
+    b = int(mats.shape[0])
+    t = int(mats.shape[1])
+    if b <= 0 or t <= 0:
+        return
+    if max_paths is not None:
+        b_use = min(int(max_paths), b)
+        mats = mats[:b_use]
+
+    mats = 0.5 * (mats + np.swapaxes(mats, -1, -2))
+    eig = np.linalg.eigvalsh(mats)  # (B,T,3)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize, sharex=True, sharey=True)
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+    labels = [r"$\lambda_1$", r"$\lambda_2$", r"$\lambda_3$"]
+    q_low, q_inner_low, q_inner_high, q_high = quantiles
+    time_idx = np.arange(int(eig.shape[1]))
+
+    for k in range(3):
+        e_k = eig[:, :, k]
+        q_low_k = np.quantile(e_k, q_low, axis=0)
+        q_inner_low_k = np.quantile(e_k, q_inner_low, axis=0)
+        q_inner_high_k = np.quantile(e_k, q_inner_high, axis=0)
+        q_high_k = np.quantile(e_k, q_high, axis=0)
+        med_k = np.quantile(e_k, 0.5, axis=0)
+        ax.fill_between(
+            time_idx, q_low_k, q_high_k, color=colors[k], alpha=float(alpha_outer)
+        )
+        ax.fill_between(
+            time_idx,
+            q_inner_low_k,
+            q_inner_high_k,
+            color=colors[k],
+            alpha=float(alpha_inner),
+        )
+        ax.plot(
+            time_idx,
+            med_k,
+            color=colors[k],
+            linewidth=1.5,
+            label=labels[k],
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel("time index")
+    ax.set_ylabel("eigenvalue")
+    ax.legend(loc="best", frameon=False)
     fig.tight_layout()
 
     base, _ = os.path.splitext(out_file)

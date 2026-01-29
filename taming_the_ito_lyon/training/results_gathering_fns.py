@@ -4,9 +4,10 @@ matplotlib.use("Agg")
 from taming_the_ito_lyon.utils.mpl_style import apply_mpl_style
 from taming_the_ito_lyon.training.results_plotting import (
     save_rough_volatility_two_panel_plot,
+    save_rough_volatility_fan_plot,
     save_sg_so3_sphere_plot,
-    save_spd_covariance_eigenvalue_trajectory_plot,
-    save_spd_covariance_eigenvalue_fan_plot,
+    save_spd_covariance_eigenvalue_trajectory_single_plot,
+    save_spd_covariance_eigenvalue_fan_single_plot,
 )
 from taming_the_ito_lyon.training.losses import (
     frobenius_loss,
@@ -373,6 +374,24 @@ def get_rough_volatility_results(
             left_title="Targets (one batch)",
             right_title="Preds (one batch)",
         )
+        fan_base_dir = os.environ.get(
+            "ROUGH_VOL_FAN_PLOT_DIR", "z_paper_content/rough_volatility_fan_by_epoch"
+        )
+        fan_out_dir = os.path.join(fan_base_dir, model_name)
+        os.makedirs(fan_out_dir, exist_ok=True)
+        max_paths_env = os.environ.get("ROUGH_VOL_FAN_MAX_PATHS", "")
+        max_paths = int(max_paths_env) if max_paths_env.isdigit() else None
+        preds_label = os.environ.get("ROUGH_VOL_FAN_PREDS_LABEL", "Preds")
+        save_rough_volatility_fan_plot(
+            targets=targets0_flat,
+            preds=preds0_flat,
+            out_file=os.path.join(fan_out_dir, f"fan_epoch_{epoch_idx:05d}.png"),
+            max_paths=max_paths,
+            targets_label="Targets",
+            preds_label=preds_label,
+            targets_color="0.25",
+            preds_color="tab:orange",
+        )
 
     if times_to_save is None:
         return ResultsDict(eval_metric=None, results_times=[], results=[])
@@ -607,11 +626,17 @@ def get_spd_covariance_results(
         )
         out_dir = os.path.join(base_out_dir, model_name)
         os.makedirs(out_dir, exist_ok=True)
-        save_spd_covariance_eigenvalue_trajectory_plot(
-            targets=targets_np,
-            preds=preds_np,
-            out_file=os.path.join(out_dir, f"eig_epoch_{epoch_number:05d}.png"),
+        save_spd_covariance_eigenvalue_trajectory_single_plot(
+            paths=targets_np,
+            out_file=os.path.join(out_dir, f"eig_targets_epoch_{epoch_number:05d}.png"),
             n_plot=n_plot0,
+            title="Targets (eigenvalues)",
+        )
+        save_spd_covariance_eigenvalue_trajectory_single_plot(
+            paths=preds_np,
+            out_file=os.path.join(out_dir, f"eig_preds_epoch_{epoch_number:05d}.png"),
+            n_plot=n_plot0,
+            title="Preds (eigenvalues)",
         )
         fan_out_dir = os.environ.get(
             "SPD_COV_EIG_FAN_PLOT_DIR", "z_paper_content/spd_covariance_fan_by_epoch"
@@ -620,11 +645,17 @@ def get_spd_covariance_results(
         os.makedirs(fan_out_dir, exist_ok=True)
         max_paths_env = os.environ.get("SPD_COV_EIG_FAN_MAX_PATHS", "")
         max_paths = int(max_paths_env) if max_paths_env.isdigit() else None
-        save_spd_covariance_eigenvalue_fan_plot(
-            targets=targets_np,
-            preds=preds_np,
-            out_file=os.path.join(fan_out_dir, f"fan_epoch_{epoch_number:05d}.png"),
+        save_spd_covariance_eigenvalue_fan_single_plot(
+            paths=targets_np,
+            out_file=os.path.join(fan_out_dir, f"fan_targets_epoch_{epoch_number:05d}.png"),
             max_paths=max_paths,
+            title="Targets (eigenvalues)",
+        )
+        save_spd_covariance_eigenvalue_fan_single_plot(
+            paths=preds_np,
+            out_file=os.path.join(fan_out_dir, f"fan_preds_epoch_{epoch_number:05d}.png"),
+            max_paths=max_paths,
+            title="Preds (eigenvalues)",
         )
 
     if times_to_save is None:

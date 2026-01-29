@@ -78,7 +78,9 @@ def experiment(
         model: Model,
         opt_state: optax.OptState,
     ) -> tuple[jax.Array, Model, optax.OptState]:
-        loss_value, grads = runtime.grad_fn(model, control_values_b, target_b, gt_driver_b)
+        loss_value, grads = runtime.grad_fn(
+            model, control_values_b, target_b, gt_driver_b
+        )
         params = eqx.filter(model, eqx.is_inexact_array)
         updates, new_opt_state = optim.update(grads, opt_state, params)
         updated_model: Model = eqx.apply_updates(model, updates)
@@ -415,7 +417,10 @@ def _save_sg_so3_combined_plots(base_run_dir: str, subdirs: list[str]) -> None:
             chosen[model_name] = (subdir, batch_path)
             continue
         prev_subdir, _ = prev
-        if os.path.basename(prev_subdir) != model_name and os.path.basename(subdir) == model_name:
+        if (
+            os.path.basename(prev_subdir) != model_name
+            and os.path.basename(subdir) == model_name
+        ):
             chosen[model_name] = (subdir, batch_path)
 
     for model_name, (_, batch_path) in sorted(chosen.items()):

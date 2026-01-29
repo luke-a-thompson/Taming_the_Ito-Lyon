@@ -62,7 +62,16 @@ def main() -> None:
         default=None,
         help="Number of sequential seeds to run (used with --seed-start)",
     )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Optional label for model fan plots (defaults to 'Preds').",
+    )
     args = parser.parse_args()
+
+    if args.model_name:
+        os.environ["ROUGH_VOL_FAN_PREDS_LABEL"] = str(args.model_name)
 
     seeds = _parse_seeds(args.seeds)
     seed_start = args.seed_start
