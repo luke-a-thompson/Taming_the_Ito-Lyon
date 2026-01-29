@@ -1,5 +1,4 @@
 import jax
-import jax.numpy as jnp
 import optax
 from taming_the_ito_lyon.config import (
     Optimizer,
@@ -325,21 +324,23 @@ def create_dataloaders(
                 config=config,
                 split="test",
             ).make_disk_source()
-        case Datasets.SPD_COVARIANCE_SOLAR:
+        case Datasets.SPD_COVARIANCE_SOLAR | Datasets.SPD_WISHART_DIFFUSION:
             from taming_the_ito_lyon.data.spd_covariance import SPDCovarianceDataset
+            from taming_the_ito_lyon.data.spd_wishart_diffusion import (
+                SPDWishartDiffusionDataset,
+            )
 
-            train = SPDCovarianceDataset(
-                config=config,
-                split="train",
-            ).make_array_source()
-            val = SPDCovarianceDataset(
-                config=config,
-                split="val",
-            ).make_array_source()
-            test = SPDCovarianceDataset(
-                config=config,
-                split="test",
-            ).make_array_source()
+            spd_dataset_cls: (
+                type[SPDCovarianceDataset] | type[SPDWishartDiffusionDataset]
+            )
+            if config.experiment_config.dataset_name == Datasets.SPD_WISHART_DIFFUSION:
+                spd_dataset_cls = SPDWishartDiffusionDataset
+            else:
+                spd_dataset_cls = SPDCovarianceDataset
+
+            train = spd_dataset_cls(config=config, split="train").make_disk_source()
+            val = spd_dataset_cls(config=config, split="val").make_disk_source()
+            test = spd_dataset_cls(config=config, split="test").make_disk_source()
         case _:
             raise ValueError(
                 f"Unknown dataset name: {config.experiment_config.dataset_name}"
@@ -455,13 +456,13 @@ def create_grad_batch_loss_fns(
         truncated_sig_loss_time_augmented,
         branched_sigker_loss,
         frobenius_loss,
-        ito_level2_distribution_mmd_loss,
         _maybe_unvech_spd,
     )
 
     loss_fn: Callable[[jax.Array, jax.Array], jax.Array] | None = None
     base_branched_loss_fn: (
-        Callable[[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array] | None
+        Callable[[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array]
+        | None
     ) = None
     sigker_branched_use_w = False
 
@@ -496,10 +497,6 @@ def create_grad_batch_loss_fns(
                     "output_path_dim must be provided when loss_type is SIGKER_BRANCHED so the "
                     "Hopf algebra can be constructed outside of jit."
                 )
-            if int(output_path_dim) != 1:
-                raise ValueError(
-                    "SIGKER_BRANCHED currently supports scalar outputs only (output_path_dim=1)."
-                )
             # Use planar branched signature iff the configured Hopf algebra is MKW.
             use_planar = bool(
                 hasattr(config.nn_config, "hopf_algebra")
@@ -520,6 +517,7 @@ def create_grad_batch_loss_fns(
                 use_planar=use_planar,
                 use_time=True,
                 use_w=bool(sigker_branched_use_w),
+                x_dim=int(output_path_dim),
                 anchor_at_start=False,
                 prepend_zero_basepoint=True,
             )
@@ -530,19 +528,9 @@ def create_grad_batch_loss_fns(
         raise RuntimeError("No base loss configured.")
 
     use_spd = config.experiment_config.manifold == ManifoldType.SPD
-    if use_spd and config.experiment_config.loss in (LossType.SIGKER, LossType.SIGKER_BRANCHED):
-        raise ValueError(
-            "SIGKER/SIGKER_BRANCHED loss expects vector-valued paths. For SPD outputs, use MSE or "
-            "FROBENIUS and enable SPD manifold output."
-        )
-
-    use_ito_mmd_loss = (
-        config.experiment_config.loss == LossType.SIGKER
-        and isinstance(config.nn_config, MNRDEConfig)
-        and config.nn_config.hopf_algebra == HopfAlgebraType.GL
-        and config.experiment_config.dataset_name == Datasets.SIMPLE_RBERGOMI
-    )
-    ito_weight = float(config.experiment_config.ito_level2_mmd_weight)
+    # Note: `SIGKER` can operate on SPD outputs by converting 3x3 matrix paths to a
+    # Euclidean representation inside the loss (e.g. vech(X) for SPD). We therefore
+    # allow SIGKER in SPD mode.
 
     def batch_loss_fn(
         model: Model,
@@ -555,9 +543,6 @@ def create_grad_batch_loss_fns(
             preds = _maybe_unvech_spd(preds)
             target_b = _maybe_unvech_spd(target_b)
         if config.experiment_config.loss == LossType.SIGKER_BRANCHED:
-            # X_model/X_gt: log-price paths (channel 0).
-            x_model = preds[..., 0]
-            x_gt = target_b[..., 0]
             assert base_branched_loss_fn is not None
             if sigker_branched_use_w:
                 w_model = (
@@ -566,37 +551,22 @@ def create_grad_batch_loss_fns(
                     else control_values_b[..., 0]
                 )
                 w_gt = gt_driver_b[..., 0]
-                base = base_branched_loss_fn(x_model, x_gt, w_model, w_gt)
+                base = base_branched_loss_fn(preds, target_b, w_model, w_gt)
             else:
-                base = base_branched_loss_fn(x_model, x_gt, None, None)
+                # For Wishart diffusion SPD datasets, `gt_driver_b` is a side-channel
+                # containing the bracket density for vech(X) (flattened 6x6 per time).
+                if (
+                    config.experiment_config.dataset_name
+                    == Datasets.SPD_WISHART_DIFFUSION
+                ):
+                    base = base_branched_loss_fn(preds, target_b, None, gt_driver_b)
+                else:
+                    base = base_branched_loss_fn(preds, target_b, None, None)
         else:
             assert loss_fn is not None
             base = loss_fn(preds, target_b)
 
-        if not use_ito_mmd_loss or ito_weight <= 0.0:
-            return base
-
-        # W_model: latent Brownian channel from controls. In unconditional mode the
-        # control is (t, W), so time is channel 0 and must be excluded from
-        # quadratic variation.
-        w_model = control_values_b[..., 1] if int(control_values_b.shape[-1]) >= 2 else control_values_b[..., 0]
-
-        # W_gt: simulator Brownian driver from dataset (no time channel).
-        w_gt = gt_driver_b[..., 0]
-
-        # X_model/X_gt: log-price paths (channel 0).
-        x_model = preds[..., 0]
-        x_gt = target_b[..., 0]
-
-        ito_mmd = ito_level2_distribution_mmd_loss(
-            w_model=w_model,
-            x_model=x_model,
-            w_gt=w_gt,
-            x_gt=x_gt,
-            include_level1=True,
-            max_bandwidth_points=256,
-        )
-        return base + jnp.asarray(ito_weight, dtype=base.dtype) * ito_mmd
+        return base
 
     def loss_on_preds_fn(
         preds: jax.Array,
@@ -608,8 +578,6 @@ def create_grad_batch_loss_fns(
             preds = _maybe_unvech_spd(preds)
             target_b = _maybe_unvech_spd(target_b)
         if config.experiment_config.loss == LossType.SIGKER_BRANCHED:
-            x_model = preds[..., 0]
-            x_gt = target_b[..., 0]
             assert base_branched_loss_fn is not None
             if sigker_branched_use_w:
                 w_model = (
@@ -618,28 +586,19 @@ def create_grad_batch_loss_fns(
                     else control_values_b[..., 0]
                 )
                 w_gt = gt_driver_b[..., 0]
-                base = base_branched_loss_fn(x_model, x_gt, w_model, w_gt)
+                base = base_branched_loss_fn(preds, target_b, w_model, w_gt)
             else:
-                base = base_branched_loss_fn(x_model, x_gt, None, None)
+                if (
+                    config.experiment_config.dataset_name
+                    == Datasets.SPD_WISHART_DIFFUSION
+                ):
+                    base = base_branched_loss_fn(preds, target_b, None, gt_driver_b)
+                else:
+                    base = base_branched_loss_fn(preds, target_b, None, None)
         else:
             assert loss_fn is not None
             base = loss_fn(preds, target_b)
-        if not use_ito_mmd_loss or ito_weight <= 0.0:
-            return base
-
-        w_model = control_values_b[..., 1] if int(control_values_b.shape[-1]) >= 2 else control_values_b[..., 0]
-        w_gt = gt_driver_b[..., 0]
-        x_model = preds[..., 0]
-        x_gt = target_b[..., 0]
-        ito_mmd = ito_level2_distribution_mmd_loss(
-            w_model=w_model,
-            x_model=x_model,
-            w_gt=w_gt,
-            x_gt=x_gt,
-            include_level1=True,
-            max_bandwidth_points=256,
-        )
-        return base + jnp.asarray(ito_weight, dtype=base.dtype) * ito_mmd
+        return base
 
     return (
         eqx.filter_value_and_grad(batch_loss_fn),
@@ -697,7 +656,7 @@ def create_results_gathering_fn(
             )
 
             return get_sg_so3_simulation_results
-        case Datasets.SPD_COVARIANCE_SOLAR:
+        case Datasets.SPD_COVARIANCE_SOLAR | Datasets.SPD_WISHART_DIFFUSION:
             from taming_the_ito_lyon.training.results_gathering_fns import (
                 get_spd_covariance_results,
             )

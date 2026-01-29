@@ -47,7 +47,7 @@ def main() -> None:
         "--seeds",
         nargs="+",
         type=str,
-        default=["1", "2", "3", "4", "5"],
+        default=None,
         help="Seeds for replicate testing (e.g. --seeds 1 2 3 or --seeds 1,2,3).",
     )
     parser.add_argument(

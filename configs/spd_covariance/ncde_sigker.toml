@@ -1,6 +1,6 @@
 [experiment_config]
 model_type = "mnrde"
-dataset_name = "spd_covariance_solar"
+dataset_name = "spd_wishart_diffusion"
 
 # Optimizer
 optimizer = "adamw"
@@ -9,14 +9,13 @@ weight_decay = 0.000001
 max_grad_norm = 1.0
 
 # Training
-loss = "sigker"
+loss = "sigker_branched"
 seed = 1
 batch_size = 16
 epochs = 100
 
 # Training mode
 training_mode = "unconditional"
-# Unconditional generation samples a Brownian motion with this many channels.
 
 manifold = "spd"
 hidden_manifold = "euclidean"
@@ -36,10 +35,10 @@ init_hidden_dim = 32
 vf_hidden_dim = 32
 initial_cond_mlp_depth = 2
 vf_mlp_depth = 2
-out_size = 1
+out_size = 6
 
 # Log-signature configuration
 signature_depth = 2
-signature_window_size = 16
+signature_window_size = 32
 
 hopf_algebra = "mkw"

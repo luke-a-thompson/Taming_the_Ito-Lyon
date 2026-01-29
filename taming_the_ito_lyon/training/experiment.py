@@ -4,6 +4,8 @@ import signal
 import time
 from typing import TypeVar
 
+import numpy as np
+
 import equinox as eqx
 import jax
 import jax.random as jr
@@ -352,9 +354,116 @@ def run_test(
 def run_test_from_run_dir(run_dir: str) -> None:
     config_path = os.path.join(run_dir, "config.toml")
     checkpoint_path = os.path.join(run_dir, "best.eqx")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config not found at {config_path}")
-    if not os.path.exists(checkpoint_path):
+    if os.path.exists(config_path) and os.path.exists(checkpoint_path):
+        config = load_toml_config(config_path)
+        run_test(config, checkpoint_path=checkpoint_path, run_dir=run_dir)
+        return
+
+    if os.path.exists(config_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
-    config = load_toml_config(config_path)
-    run_test(config, checkpoint_path=checkpoint_path, run_dir=run_dir)
+    if os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Config not found at {config_path}")
+
+    subdirs = [
+        os.path.join(run_dir, name)
+        for name in sorted(os.listdir(run_dir))
+        if os.path.isdir(os.path.join(run_dir, name))
+    ]
+    if len(subdirs) == 0:
+        raise FileNotFoundError(
+            f"No run subdirectories found under {run_dir} (expected config.toml + best.eqx)."
+        )
+
+    suppress_prev = os.environ.get("SG_SO3_SUPPRESS_INDIVIDUAL")
+    os.environ["SG_SO3_SUPPRESS_INDIVIDUAL"] = "1"
+    for subdir in subdirs:
+        sub_config_path = os.path.join(subdir, "config.toml")
+        sub_checkpoint_path = os.path.join(subdir, "best.eqx")
+        if os.path.exists(sub_config_path) and os.path.exists(sub_checkpoint_path):
+            config = load_toml_config(sub_config_path)
+            run_test(config, checkpoint_path=sub_checkpoint_path, run_dir=subdir)
+
+    _save_sg_so3_combined_plots(run_dir, subdirs)
+    if suppress_prev is None:
+        os.environ.pop("SG_SO3_SUPPRESS_INDIVIDUAL", None)
+    else:
+        os.environ["SG_SO3_SUPPRESS_INDIVIDUAL"] = suppress_prev
+
+
+def _save_sg_so3_combined_plots(base_run_dir: str, subdirs: list[str]) -> None:
+    from taming_the_ito_lyon.training.results_plotting import save_sg_so3_sphere_plot
+
+    batch_files: list[tuple[str, str]] = []
+    base_out_dir = os.environ.get(
+        "SG_SO3_SPHERE_PLOT_DIR", "z_paper_content/sg_so3_sphere_by_epoch"
+    )
+    chosen: dict[str, tuple[str, str]] = {}
+    for subdir in subdirs:
+        config_path = os.path.join(subdir, "config.toml")
+        if not os.path.exists(config_path):
+            continue
+        try:
+            config = load_toml_config(config_path)
+        except Exception:
+            continue
+        model_name = config.experiment_config.model_type.value
+        batch_path = os.path.join(base_out_dir, model_name, "sg_so3_batch.npz")
+        if not os.path.exists(batch_path):
+            continue
+        prev = chosen.get(model_name)
+        if prev is None:
+            chosen[model_name] = (subdir, batch_path)
+            continue
+        prev_subdir, _ = prev
+        if os.path.basename(prev_subdir) != model_name and os.path.basename(subdir) == model_name:
+            chosen[model_name] = (subdir, batch_path)
+
+    for model_name, (_, batch_path) in sorted(chosen.items()):
+        batch_files.append((model_name, batch_path))
+
+    if len(batch_files) == 0:
+        return
+
+    batches: list[dict[str, np.ndarray]] = []
+    model_names: list[str] = []
+    for model_name, batch_path in batch_files:
+        with np.load(batch_path) as data:
+            preds = np.asarray(data["preds"])
+            targets = np.asarray(data["targets"])
+        if preds.ndim == 3:
+            preds = preds[None, ...]
+        if targets.ndim == 3:
+            targets = targets[None, ...]
+        if preds.ndim != 4 or targets.ndim != 4:
+            continue
+        batches.append({"preds": preds, "targets": targets})
+        model_names.append(model_name)
+
+    if len(batches) == 0:
+        return
+
+    min_batch = min(int(batch["preds"].shape[0]) for batch in batches)
+    if min_batch <= 0:
+        return
+
+    out_dir = os.path.join(base_out_dir, "_combined")
+    os.makedirs(out_dir, exist_ok=True)
+
+    num_plots = int(os.environ.get("SG_SO3_NUM_PLOTS", "10"))
+    rng = np.random.default_rng(0)
+    for plot_idx in range(num_plots):
+        sample_idx = int(rng.integers(0, min_batch))
+        preds_stack = np.stack(
+            [batch["preds"][sample_idx] for batch in batches], axis=0
+        )
+        targets_ref = batches[0]["targets"][sample_idx : sample_idx + 1]
+        filename = f"sphere_epoch_00000_sample_{plot_idx:02d}.pdf"
+        if num_plots == 1:
+            filename = "sphere_epoch_00000.pdf"
+        save_sg_so3_sphere_plot(
+            preds=preds_stack,
+            targets=targets_ref,
+            out_file=os.path.join(out_dir, filename),
+            n_plot=int(preds_stack.shape[0]),
+            labels=model_names,
+        )

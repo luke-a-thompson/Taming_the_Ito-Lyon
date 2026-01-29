@@ -79,14 +79,6 @@ def build_runtime(config: Config, loader_key: jax.Array) -> ExperimentRuntime:
     # Do not infer model output head size from this blindly.
     ts_full = jnp.linspace(0.0, 1.0, timesteps, dtype=shape_batch["solution"].dtype)
 
-    if mode == TrainingMode.UNCONDITIONAL:
-        # Model consumes (time + sampled driver channels)
-        input_path_dim = 2  # (t, W)
-    elif config.experiment_config.extrapolation_scheme is not None:
-        input_path_dim = int(input_channels) + 1  # time concat
-    else:
-        input_path_dim = int(input_channels)
-
     # For SO(3) rotation-matrix datasets with rotational-geodesic loss we train a
     # 6D head and Gram–Schmidt it into a (3,3) rotation matrix via SO3.from_6d.
     is_so3_rge = config.experiment_config.dataset_name in (
@@ -100,10 +92,24 @@ def build_runtime(config: Config, loader_key: jax.Array) -> ExperimentRuntime:
     else:
         output_head_dim = 6 if is_so3_rge else int(shape_batch["solution"].shape[-1])
 
+    # In unconditional mode, the model consumes a sampled Brownian control with time
+    # prepended. For Wishart/SPD experiments, a 1D driver is often too restrictive
+    # (it yields rank-1 quadratic variation in vech-space), so for MNRDE we use a
+    # higher-dimensional latent Brownian by default.
+    if mode == TrainingMode.UNCONDITIONAL:
+        driver_dim = 1
+        if config.experiment_config.model_type == ModelType.MNRDE:
+            driver_dim = int(output_head_dim)
+        input_path_dim = int(driver_dim) + 1  # (t, W^driver_dim)
+    elif config.experiment_config.extrapolation_scheme is not None:
+        input_path_dim = int(input_channels) + 1  # time concat
+    else:
+        input_path_dim = int(input_channels)
+
     unconditional_control_sampler = None
     if mode == TrainingMode.UNCONDITIONAL:
         unconditional_control_sampler = create_unconditional_control_sampler_batched(
-            driver_dim=1,
+            driver_dim=int(input_path_dim) - 1,
         )
 
     grad_fn, batch_loss_fn, loss_on_preds_fn = create_grad_batch_loss_fns(

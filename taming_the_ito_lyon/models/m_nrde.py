@@ -186,9 +186,7 @@ class MNDRE(eqx.Module):
             if brownian_channels is not None
             else None
         )
-        self.brownian_corr = (
-            float(brownian_corr) if brownian_corr is not None else None
-        )
+        self.brownian_corr = float(brownian_corr) if brownian_corr is not None else None
         match hopf_algebra_type:
             case HopfAlgebraType.SHUFFLE:
                 self.hopf_algebra = ShuffleHopfAlgebra.build(

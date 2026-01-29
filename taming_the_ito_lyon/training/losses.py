@@ -183,32 +183,74 @@ def truncated_sig_loss_time_augmented(
     This is the recommended variant for **1D outputs** where plain signatures
     largely collapse to increment-only information.
 
-    We construct 2D paths (t, x_t) with t in [0, 1], then compute truncated
+    We construct augmented paths (t, x_t) with t in [0, 1], then compute truncated
     log-signatures as features and apply the same dot-product kernel score.
+
+    This loss accepts either:
+    - vector-valued paths shaped (B, T, C), or
+    - 3x3 matrix-valued paths shaped (B, T, 3, 3). These are interpreted as either
+      SO(3) rotations (mapped via a log-map to (T, 3)) or SPD matrices (mapped via
+      `SPDManifold.vech` to (T, 6)), depending on which structure the matrices
+      satisfy.
     """
     from stochastax.control_lifts import compute_path_signature
     from stochastax.hopf_algebras.hopf_algebras import ShuffleHopfAlgebra
+    from taming_the_ito_lyon.utils.so3 import log_map
 
     ambient_dim = int(value_dim) + 1
     hopf = ShuffleHopfAlgebra.build(ambient_dim=int(ambient_dim), depth=int(depth))
+    # Special-case: if the provided paths are 3x3 matrices, convert them to a
+    # Euclidean path inside the loss:
+    # - SO(3): log-map of the relative rotation (T,3)
+    # - SPD: vech(X) (T,6)
+    so3_value_dim = 3
+    hopf_so3 = ShuffleHopfAlgebra.build(
+        ambient_dim=int(so3_value_dim) + 1, depth=int(depth)
+    )
 
     def loss(pred: jax.Array, target: jax.Array) -> jax.Array:
         assert pred.shape == target.shape, (
             f"pred and target must have the same shape, got {pred.shape} and {target.shape}"
         )
-        assert int(pred.shape[-1]) == int(value_dim), (
-            f"Expected value dimension {int(value_dim)}, got {int(pred.shape[-1])}. "
-            "Pass the correct `value_dim` when constructing the loss."
-        )
+        is_matrix_3x3 = pred.ndim == 4 and pred.shape[-2:] == (3, 3)
+        if not is_matrix_3x3:
+            assert int(pred.shape[-1]) == int(value_dim), (
+                f"Expected value dimension {int(value_dim)}, got {int(pred.shape[-1])}. "
+                "Pass the correct `value_dim` when constructing the loss."
+            )
 
-        length = int(pred.shape[-2])
+        # `pred` is batched as (B, T, ...) for all datasets; for matrix-valued paths
+        # the last two axes are (3,3), so we must NOT read time from `shape[-2]`.
+        length = int(pred.shape[1])
         ts = jnp.linspace(0.0, 1.0, length, dtype=pred.dtype)  # (T,)
         ts_col = ts[:, None]  # (T, 1)
 
+        def _to_euclidean_path(path: jax.Array) -> jax.Array:
+            # path: (T, C) or (T, 3, 3)
+            if path.ndim == 3 and path.shape[-2:] == (3, 3):
+                # Disambiguate SO(3) vs SPD **statically** based on the configured
+                # `value_dim`. This avoids `jax.lax.cond` shape constraints.
+                #
+                # - SO(3): value_dim=3, map via log-map to (T,3)
+                # - SPD(3): value_dim=6, map via vech to (T,6)
+                if int(value_dim) == 3:
+                    r0 = path[:1]  # (1,3,3)
+                    r0_t = jnp.swapaxes(r0, -1, -2)  # (1,3,3)
+                    rel = r0_t @ path  # (T,3,3), broadcasts over T
+                    return log_map(rel)  # (T,3)
+                if int(value_dim) == 6:
+                    return SPDManifold.vech(path)  # (T,6)
+                raise ValueError(
+                    "Matrix-valued paths require value_dim=3 (SO3) or value_dim=6 (SPD vech). "
+                    f"Got value_dim={int(value_dim)}."
+                )
+            return path
+
         def _augment(path: jax.Array) -> jax.Array:
+            path = _to_euclidean_path(path)
             if anchor_at_start:
                 path = path - path[:1]
-            aug = jnp.concatenate([ts_col, path], axis=-1)  # (T, 1+value_dim)
+            aug = jnp.concatenate([ts_col, path], axis=-1)  # (T, 1+this_value_dim)
             if not prepend_zero_basepoint:
                 return aug
 
@@ -221,15 +263,16 @@ def truncated_sig_loss_time_augmented(
             #
             # Note: we duplicate t=0 at the first two points; this is fine for
             # signature computation since it depends on increments, not on dt.
-            zero0 = jnp.zeros((1, int(ambient_dim)), dtype=aug.dtype)
+            zero0 = jnp.zeros((1, int(aug.shape[-1])), dtype=aug.dtype)
             return jnp.concatenate([zero0, aug], axis=0)  # (T+1, 1+value_dim)
 
         def _phi(path: jax.Array) -> jax.Array:
             aug = _augment(path)
+            this_hopf = hopf_so3 if int(aug.shape[-1]) == (so3_value_dim + 1) else hopf
             sig = compute_path_signature(
                 path=aug,
                 depth=depth,
-                hopf=hopf,
+                hopf=this_hopf,
                 mode="full",
             )
             return sig.flatten()
@@ -247,10 +290,11 @@ def truncated_sig_loss_time_augmented(
 
 def branched_sigker_loss(
     *,
-    depth: int = 5,
+    depth: int = 4,
     use_planar: bool,
     use_time: bool,
     use_w: bool,
+    x_dim: int = 1,
     anchor_at_start: bool = True,
     prepend_zero_basepoint: bool = True,
 ) -> Callable[[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array]:
@@ -262,8 +306,13 @@ def branched_sigker_loss(
 
     Shapes
     ------
-    - x_paths: (B, T)
-    - w_paths: (B, T) if `use_w=True`, otherwise ignored
+    - x_paths: (B, T, C) or (B, T) (treated as C=1). Also accepts SPD matrices
+      shaped (B, T, 3, 3) and converts them to vech(X) internally.
+    - w_paths: (B, T) if `use_w=True`, otherwise ignored.
+    - If `use_w=False`, the optional `target_w` argument may be used as a
+      per-step bracket *density* side-channel for x_paths, e.g. (B, T, 36)
+      representing (6x6) densities for vech(X). This is used for Wishart/SPD
+      datasets where quadratic variation is provided by the simulator.
 
     Constructed multi-channel path Y has shape (T, d):
     - if use_time and use_w: Y = (t, w, x), d=3
@@ -281,21 +330,51 @@ def branched_sigker_loss(
     if depth_i <= 0:
         raise ValueError("depth must be >= 1")
 
-    d = (1 if use_time else 0) + (1 if use_w else 0) + 1
+    from stochastax.manifolds.spd import SPDManifold
+
+    x_dim_i = int(x_dim)
+    if x_dim_i <= 0:
+        raise ValueError("x_dim must be >= 1")
+
+    d_static = (1 if use_time else 0) + (1 if use_w else 0) + int(x_dim_i)
 
     hopf_planar = (
-        MKWHopfAlgebra.build(ambient_dim=int(d), depth=int(depth_i)) if use_planar else None
+        MKWHopfAlgebra.build(ambient_dim=int(d_static), depth=int(depth_i))
+        if use_planar
+        else None
     )
     hopf_nonplanar = (
-        GLHopfAlgebra.build(ambient_dim=int(d), depth=int(depth_i)) if not use_planar else None
+        GLHopfAlgebra.build(ambient_dim=int(d_static), depth=int(depth_i))
+        if not use_planar
+        else None
     )
 
-    def _ensure_2d_paths(x: jax.Array, name: str) -> jax.Array:
-        if x.ndim == 3 and int(x.shape[-1]) == 1:
-            x = x[..., 0]
-        if x.ndim != 2:
-            raise ValueError(f"Expected {name} shaped (B, T), got {x.shape}")
-        return x
+    def _ensure_btc_paths(x: jax.Array, name: str) -> jax.Array:
+        # Accept (B,T), (B,T,1), (B,T,C), or (B,T,3,3) (SPD matrices).
+        if x.ndim == 2:
+            return x[..., None]
+        if x.ndim == 3:
+            return x
+        if x.ndim == 4 and x.shape[-2:] == (3, 3):
+            # Convert SPD matrix path to vech path (B,T,6).
+            b = int(x.shape[0])
+            t = int(x.shape[1])
+            x_flat = x.reshape((b * t,) + (3, 3))
+            vech_flat = SPDManifold.vech(x_flat)  # (B*T, 6)
+            return vech_flat.reshape((b, t, 6))
+        raise ValueError(f"Expected {name} shaped (B,T), (B,T,C), or (B,T,3,3); got {x.shape}")
+
+    def _maybe_parse_cov_density(cov: jax.Array | None, *, B: int, T: int) -> jax.Array | None:
+        # Wishart dataset stores instantaneous bracket density for vech(X) as (B,T,36).
+        if cov is None:
+            return None
+        if cov.ndim == 3 and int(cov.shape[0]) == int(B) and int(cov.shape[1]) == int(T):
+            if int(cov.shape[2]) == int(x_dim_i * x_dim_i):
+                return cov.reshape((B, T, int(x_dim_i), int(x_dim_i)))
+        if cov.ndim == 4 and int(cov.shape[0]) == int(B) and int(cov.shape[1]) == int(T):
+            if cov.shape[-2:] == (int(x_dim_i), int(x_dim_i)):
+                return cov
+        return None
 
     def loss(
         pred_x: jax.Array,
@@ -303,34 +382,57 @@ def branched_sigker_loss(
         pred_w: jax.Array | None = None,
         target_w: jax.Array | None = None,
     ) -> jax.Array:
-        pred_x_ = _ensure_2d_paths(pred_x, "pred_x")
-        target_x_ = _ensure_2d_paths(target_x, "target_x")
-        if pred_x_.shape != target_x_.shape:
+        pred_x_btc = _ensure_btc_paths(pred_x, "pred_x")  # (B,T,C)
+        target_x_btc = _ensure_btc_paths(target_x, "target_x")  # (B,T,C)
+        if pred_x_btc.shape != target_x_btc.shape:
             raise ValueError(
-                f"pred_x and target_x must have the same shape, got {pred_x_.shape} and {target_x_.shape}"
+                f"pred_x and target_x must have the same shape, got {pred_x_btc.shape} and {target_x_btc.shape}"
+            )
+        if int(pred_x_btc.shape[2]) != int(x_dim_i):
+            raise ValueError(
+                f"Expected x_dim={int(x_dim_i)} channels after conversion, got {int(pred_x_btc.shape[2])}."
             )
 
         if use_w:
             if pred_w is None or target_w is None:
                 raise ValueError("use_w=True requires pred_w and target_w.")
-            pred_w_ = _ensure_2d_paths(pred_w, "pred_w")
-            target_w_ = _ensure_2d_paths(target_w, "target_w")
-            if pred_w_.shape != pred_x_.shape or target_w_.shape != target_x_.shape:
+            # W is always (B,T) or (B,T,1); squeeze to (B,T)
+            pred_w_btc = _ensure_btc_paths(pred_w, "pred_w")
+            target_w_btc = _ensure_btc_paths(target_w, "target_w")
+            if int(pred_w_btc.shape[2]) != 1 or int(target_w_btc.shape[2]) != 1:
+                raise ValueError(f"Expected pred_w/target_w to be scalar paths, got {pred_w_btc.shape} and {target_w_btc.shape}")
+            pred_w_ = pred_w_btc[..., 0]
+            target_w_ = target_w_btc[..., 0]
+            if pred_w_.shape[:2] != pred_x_btc.shape[:2] or target_w_.shape[:2] != target_x_btc.shape[:2]:
                 raise ValueError(
                     "pred_w/target_w must match pred_x/target_x shapes, got "
-                    f"{pred_w_.shape}, {target_w_.shape} vs {pred_x_.shape}."
+                    f"{pred_w_.shape}, {target_w_.shape} vs {pred_x_btc.shape}."
                 )
         else:
             pred_w_ = None
+            # In use_w=False mode, we optionally interpret `target_w` as a bracket density.
             target_w_ = None
 
-        B, T = pred_x_.shape
+        B, T, C = pred_x_btc.shape
         if int(T) < 2 or int(B) < 1:
             return jnp.asarray(0.0, dtype=jnp.float32)
 
-        ts = jnp.linspace(0.0, 1.0, int(T), dtype=pred_x_.dtype)  # (T,)
+        ts = jnp.linspace(0.0, 1.0, int(T), dtype=pred_x_btc.dtype)  # (T,)
+        dt = ts[1:] - ts[:-1]  # (T-1,)
+
+        cov_density_target_b = (
+            _maybe_parse_cov_density(target_w, B=int(B), T=int(T)) if not use_w else None
+        )
+        has_density_target = cov_density_target_b is not None
+        if cov_density_target_b is None:
+            cov_density_target_b = jnp.zeros(
+                (int(B), int(T), int(C), int(C)), dtype=pred_x_btc.dtype
+            )
+
+        d = int(d_static)
 
         def _augment_single(x_path: jax.Array, w_path: jax.Array | None) -> jax.Array:
+            # x_path: (T,C)
             if anchor_at_start:
                 x_path = x_path - x_path[:1]
                 if w_path is not None:
@@ -338,44 +440,47 @@ def branched_sigker_loss(
 
             cols: list[jax.Array] = []
             if use_time:
-                cols.append(ts)
+                cols.append(ts[:, None])
             if use_w:
                 assert w_path is not None
-                cols.append(w_path)
+                cols.append(w_path[:, None])
             cols.append(x_path)
-            y = jnp.stack(cols, axis=1)  # (T, d)
+            y = jnp.concatenate(cols, axis=1)  # (T, d)
 
             if not prepend_zero_basepoint:
                 return y
             zero0 = jnp.zeros((1, int(d)), dtype=y.dtype)
             return jnp.concatenate([zero0, y], axis=0)  # (T+1, d)
 
-        def _cov_increments_from_path(path: jax.Array) -> jax.Array:
-            # `cov_increments[k]` is interpreted as the per-step quadratic covariation
-            # increment Δ⟨Y⟩_k for the *true* sampled path.
-            #
-            # If we prepend a zero basepoint, the first increment (0 -> y0) is an
-            # artificial encoding of the initial level and must NOT contribute to
-            # quadratic covariation. So we pad a leading zero and compute covariation
-            # only from the true increments.
+        def _cov_increments_from_x(
+            x_path: jax.Array, cov_density: jax.Array, has_density: bool
+        ) -> jax.Array:
+            # x_path: (T,C), cov_density: (T,C,C) instantaneous bracket density d/dt <x>_t.
+            # Returns per-step increments Δ<x>_k as (T-1,C,C).
+            if not has_density:
+                inc = jnp.diff(x_path, axis=0)  # (T-1,C)
+                return jnp.einsum("tc,td->tcd", inc, inc)
+            return cov_density[:-1] * dt[:, None, None]
+
+        def _embed_cov_increments(dqv_x: jax.Array, *, dtype: jnp.dtype) -> jax.Array:
+            # dqv_x: (T-1,C,C) -> (T-1,d,d) (with time/w cross terms zero)
+            cov = jnp.zeros((int(dqv_x.shape[0]), int(d), int(d)), dtype=dtype)
+            start = (1 if use_time else 0) + (1 if use_w else 0)
+            cov = cov.at[:, start:, start:].set(dqv_x)
             if prepend_zero_basepoint:
-                # path has shape (T+1, d); true increments are between path[1:] points.
-                inc_true = jnp.diff(path[1:], axis=0)  # (T-1, d)
-                cov_true = jnp.einsum("td,te->tde", inc_true, inc_true)  # (T-1, d, d)
-                cov0 = jnp.zeros((1, int(d), int(d)), dtype=path.dtype)  # (1, d, d)
-                cov = jnp.concatenate([cov0, cov_true], axis=0)  # (T, d, d)
-            else:
-                inc = jnp.diff(path, axis=0)  # (T-1, d)
-                cov = jnp.einsum("td,te->tde", inc, inc)  # (T-1, d, d)
-            if use_time:
-                cov = cov.at[:, 0, :].set(0.0)
-                cov = cov.at[:, :, 0].set(0.0)
-            # Outer products are symmetric; time-zeroing preserves symmetry.
+                cov0 = jnp.zeros((1, int(d), int(d)), dtype=dtype)
+                cov = jnp.concatenate([cov0, cov], axis=0)  # (T,d,d)
             return cov
 
-        def _phi_single(x_path: jax.Array, w_path: jax.Array | None) -> jax.Array:
+        def _phi_single(
+            x_path: jax.Array, w_path: jax.Array | None, cov_density: jax.Array, has_density: bool
+        ) -> jax.Array:
+            # Build cov increments using x-path only, then embed into (t,w,x) coordinates.
+            dqv_x = _cov_increments_from_x(
+                x_path, cov_density, has_density
+            )
+            cov_inc = _embed_cov_increments(dqv_x, dtype=x_path.dtype)
             path = _augment_single(x_path, w_path)
-            cov_inc = _cov_increments_from_path(path)
             if use_planar:
                 assert hopf_planar is not None
                 sig = compute_planar_branched_signature(
@@ -398,16 +503,22 @@ def branched_sigker_loss(
 
         if use_w:
             assert pred_w_ is not None and target_w_ is not None
-            phi_pred = jax.vmap(_phi_single)(pred_x_, pred_w_)
-            phi_target = jax.vmap(_phi_single)(target_x_, target_w_)
+            cov_zeros = jnp.zeros((int(T), int(C), int(C)), dtype=pred_x_btc.dtype)
+            phi_pred = jax.vmap(lambda x, w: _phi_single(x, w, cov_zeros, False))(pred_x_btc, pred_w_)
+            phi_target = jax.vmap(lambda x, w: _phi_single(x, w, cov_zeros, False))(target_x_btc, target_w_)
         else:
-            phi_pred = jax.vmap(lambda x: _phi_single(x, None))(pred_x_)
-            phi_target = jax.vmap(lambda x: _phi_single(x, None))(target_x_)
+            cov_zeros_b = jnp.zeros((int(B), int(T), int(C), int(C)), dtype=pred_x_btc.dtype)
+            phi_pred = jax.vmap(lambda x, cov: _phi_single(x, None, cov, False))(pred_x_btc, cov_zeros_b)
+            phi_target = jax.vmap(lambda x, cov: _phi_single(x, None, cov, has_density_target))(
+                target_x_btc, cov_density_target_b
+            )
 
-        k_pp = jnp.mean(phi_pred @ phi_pred.T)
-        k_tt = jnp.mean(phi_target @ phi_target.T)
-        k_pt = jnp.mean(phi_pred @ phi_target.T)
-        return (k_pp + k_tt - 2.0 * k_pt).astype(jnp.float32)
+        # For dot-product kernels, the MMD^2 reduces to the squared distance
+        # between the mean feature embeddings. This avoids the O(B^2) Gram matrix.
+        phi_pred_mean = jnp.mean(phi_pred, axis=0)
+        phi_target_mean = jnp.mean(phi_target, axis=0)
+        diff = phi_pred_mean - phi_target_mean
+        return jnp.sum(diff * diff).astype(jnp.float32)
 
     return loss
 
@@ -420,128 +531,5 @@ def _maybe_unvech_spd(
     if x.shape[-1] == 6:
         return SPDManifold.unvech(x)
     return x
-
-
-def _ito_level12_feature_vectors(
-    *,
-    w_paths: jax.Array,
-    x_paths: jax.Array,
-    include_level1: bool = True,
-) -> jax.Array:
-    """Compute per-path Itô / branched level-1/2 features from (W, X).
-
-    Args:
-        w_paths: (B, T) latent/driver BM paths.
-        x_paths: (B, T) output log-price paths.
-        include_level1: If True, include sum(dW) and sum(dX) as extra features.
-
-    Returns:
-        (B, D) feature matrix with columns:
-            [qvW, qvX, covWX, (optional: sum_dW, sum_dX)].
-    """
-    if w_paths.ndim != 2 or x_paths.ndim != 2:
-        raise ValueError(
-            f"Expected w_paths/x_paths shaped (B, T), got {w_paths.shape} and {x_paths.shape}"
-        )
-    if w_paths.shape != x_paths.shape:
-        raise ValueError(
-            f"w_paths and x_paths must have the same shape, got {w_paths.shape} and {x_paths.shape}"
-        )
-    if int(w_paths.shape[1]) < 2:
-        b = int(w_paths.shape[0])
-        d = 5 if include_level1 else 3
-        return jnp.zeros((b, d), dtype=jnp.float32)
-
-    dW = jnp.diff(w_paths, axis=1)  # (B, T-1)
-    dX = jnp.diff(x_paths, axis=1)  # (B, T-1)
-
-    qvW = jnp.sum(dW * dW, axis=1)
-    qvX = jnp.sum(dX * dX, axis=1)
-    covWX = jnp.sum(dW * dX, axis=1)
-
-    if include_level1:
-        sum_dW = jnp.sum(dW, axis=1)
-        sum_dX = jnp.sum(dX, axis=1)
-        feat = jnp.stack([qvW, qvX, covWX, sum_dW, sum_dX], axis=1)
-    else:
-        feat = jnp.stack([qvW, qvX, covWX], axis=1)
-
-    return feat.astype(jnp.float32)
-
-
-def _rbf_mmd2_median_heuristic(
-    x: jax.Array,
-    y: jax.Array,
-    *,
-    eps: float = 1e-12,
-    max_bandwidth_points: int = 256,
-) -> jax.Array:
-    """Biased RBF-kernel MMD^2 with median-heuristic bandwidth."""
-    if x.ndim != 2 or y.ndim != 2:
-        raise ValueError(f"Expected 2D feature matrices, got {x.shape} and {y.shape}")
-    if int(x.shape[1]) != int(y.shape[1]):
-        raise ValueError(
-            f"x and y must have the same feature dimension, got {x.shape} and {y.shape}"
-        )
-
-    nx = int(x.shape[0])
-    ny = int(y.shape[0])
-    if nx == 0 or ny == 0:
-        return jnp.asarray(0.0, dtype=jnp.float32)
-
-    pooled = jnp.concatenate([x, y], axis=0)
-    m = min(int(max_bandwidth_points), int(pooled.shape[0]))
-    pooled_m = pooled[:m]
-
-    # Pairwise squared distances on pooled subset (m, m)
-    pm_norm = jnp.sum(pooled_m * pooled_m, axis=1)
-    pm_dist2 = pm_norm[:, None] + pm_norm[None, :] - 2.0 * (pooled_m @ pooled_m.T)
-    pm_dist2 = jnp.maximum(pm_dist2, 0.0)
-
-    eye = jnp.eye(int(pm_dist2.shape[0]), dtype=bool)
-    pm_dist2_no_diag = jnp.where(eye, jnp.nan, pm_dist2)
-    med = jnp.nanmedian(pm_dist2_no_diag)
-    med = jnp.where(jnp.isfinite(med) & (med > 0.0), med, 1.0)
-    med = jax.lax.stop_gradient(med)
-    denom = 2.0 * med + float(eps)
-
-    def _k(a: jax.Array, b: jax.Array) -> jax.Array:
-        a_norm = jnp.sum(a * a, axis=1)
-        b_norm = jnp.sum(b * b, axis=1)
-        dist2 = a_norm[:, None] + b_norm[None, :] - 2.0 * (a @ b.T)
-        dist2 = jnp.maximum(dist2, 0.0)
-        return jnp.exp(-dist2 / denom)
-
-    k_xx = _k(x, x)
-    k_yy = _k(y, y)
-    k_xy = _k(x, y)
-    return (jnp.mean(k_xx) + jnp.mean(k_yy) - 2.0 * jnp.mean(k_xy)).astype(
-        jnp.float32
-    )
-
-
-def ito_level2_distribution_mmd_loss(
-    *,
-    w_model: jax.Array,
-    x_model: jax.Array,
-    w_gt: jax.Array,
-    x_gt: jax.Array,
-    include_level1: bool = True,
-    max_bandwidth_points: int = 256,
-) -> jax.Array:
-    """Itô/branched level-2 distribution-matching loss for log-price paths.
-
-    Computes per-path level-1/2 features and matches them in distribution via an
-    RBF-kernel MMD^2.
-    """
-    feat_model = _ito_level12_feature_vectors(
-        w_paths=w_model, x_paths=x_model, include_level1=include_level1
-    )
-    feat_gt = _ito_level12_feature_vectors(
-        w_paths=w_gt, x_paths=x_gt, include_level1=include_level1
-    )
-    return _rbf_mmd2_median_heuristic(
-        feat_model, feat_gt, max_bandwidth_points=int(max_bandwidth_points)
-    )
 
 

@@ -5,6 +5,8 @@ from taming_the_ito_lyon.utils.mpl_style import apply_mpl_style
 from taming_the_ito_lyon.training.results_plotting import (
     save_rough_volatility_two_panel_plot,
     save_sg_so3_sphere_plot,
+    save_spd_covariance_eigenvalue_trajectory_plot,
+    save_spd_covariance_eigenvalue_fan_plot,
 )
 from taming_the_ito_lyon.training.losses import (
     frobenius_loss,
@@ -14,7 +16,7 @@ from taming_the_ito_lyon.config.config import Config
 from taming_the_ito_lyon.config.config_options import LossType, Datasets
 import jax
 import numpy as np
-from scipy.stats import ks_2samp
+from scipy.stats import ks_2samp, wasserstein_distance
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -515,12 +517,40 @@ def get_sg_so3_simulation_results(
         )
         out_dir = os.path.join(base_out_dir, model_name)
         os.makedirs(out_dir, exist_ok=True)
-        save_sg_so3_sphere_plot(
+        np.savez(
+            os.path.join(out_dir, "sg_so3_batch.npz"),
             preds=preds_np,
             targets=targets_np,
-            out_file=os.path.join(out_dir, f"sphere_epoch_{epoch_idx:05d}.png"),
-            n_plot=int(n_plot),
         )
+        if os.environ.get("SG_SO3_SUPPRESS_INDIVIDUAL", "0") == "1":
+            n_plot = None
+        num_plots = int(os.environ.get("SG_SO3_NUM_PLOTS", "50"))
+        trajs_per_plot = int(os.environ.get("SG_SO3_TRAJECTORIES_PER_PLOT", "1"))
+        n_plot0 = min(int(trajs_per_plot), int(targets_np.shape[0]))
+        rng = np.random.default_rng(int(epoch_idx))
+        for plot_idx in range(num_plots):
+            if int(targets_np.shape[0]) > n_plot0:
+                sample_idx = rng.choice(
+                    int(targets_np.shape[0]), size=n_plot0, replace=False
+                )
+                sample_preds = preds_np[sample_idx]
+                sample_targets = targets_np[sample_idx]
+                sample_labels = [model_name for _ in np.asarray(sample_idx)]
+            else:
+                sample_preds = preds_np
+                sample_targets = targets_np
+                sample_labels = [model_name for _ in range(n_plot0)]
+
+            filename = f"sphere_epoch_{epoch_idx:05d}_sample_{plot_idx:02d}.png"
+            if num_plots == 1:
+                filename = f"sphere_epoch_{epoch_idx:05d}.png"
+            save_sg_so3_sphere_plot(
+                preds=sample_preds,
+                targets=sample_targets,
+                out_file=os.path.join(out_dir, filename),
+                n_plot=n_plot0,
+                labels=sample_labels,
+            )
 
     if config is None:
         raise ValueError("config must be provided to compute RGE for SG_SO3 results.")
@@ -548,11 +578,111 @@ def get_spd_covariance_results(
     controls: list[jax.Array] | jax.Array | None,
     epoch_idx: int,
     model_name: str,
-    times_to_save: list[int] | None = None,
+    times_to_save: list[int] | None = [128, 256, 384, 512],
     n_plot: int | None = None,
     save_plot_every: int = 1,
     config: Config | None = None,
 ) -> ResultsDict:
-    """Minimal results hook for SPD covariance datasets."""
-    del preds, targets, controls, epoch_idx, model_name, times_to_save, n_plot, save_plot_every, config
-    return ResultsDict(eval_metric=None, results_times=[], results=[])
+    """Plot eigenvalue trajectories for SPD covariance (targets vs preds).
+
+    Note: `epoch_idx` is 0-based (as used throughout the training loop). For plot
+    saving cadence and filenames we use the human-friendly 1-based epoch number
+    `epoch_idx + 1`, so "10th epoch" corresponds to epoch_idx==9.
+    """
+    del controls, config
+
+    # We only ever plot one batch. If a list is passed, take the first batch.
+    preds0 = preds[0] if isinstance(preds, list) else preds
+    targets0 = targets[0] if isinstance(targets, list) else targets
+
+    preds_np = np.array(jax.device_get(preds0))
+    targets_np = np.array(jax.device_get(targets0))
+
+    epoch_number = int(epoch_idx) + 1
+    save_every = max(1, int(save_plot_every))
+    if n_plot is not None and epoch_number % save_every == 0:
+        n_plot0 = min(int(n_plot), int(targets_np.shape[0]))
+        base_out_dir = os.environ.get(
+            "SPD_COV_EIG_PLOT_DIR", "z_paper_content/spd_covariance_eigs_by_epoch"
+        )
+        out_dir = os.path.join(base_out_dir, model_name)
+        os.makedirs(out_dir, exist_ok=True)
+        save_spd_covariance_eigenvalue_trajectory_plot(
+            targets=targets_np,
+            preds=preds_np,
+            out_file=os.path.join(out_dir, f"eig_epoch_{epoch_number:05d}.png"),
+            n_plot=n_plot0,
+        )
+        fan_out_dir = os.environ.get(
+            "SPD_COV_EIG_FAN_PLOT_DIR", "z_paper_content/spd_covariance_fan_by_epoch"
+        )
+        fan_out_dir = os.path.join(fan_out_dir, model_name)
+        os.makedirs(fan_out_dir, exist_ok=True)
+        max_paths_env = os.environ.get("SPD_COV_EIG_FAN_MAX_PATHS", "")
+        max_paths = int(max_paths_env) if max_paths_env.isdigit() else None
+        save_spd_covariance_eigenvalue_fan_plot(
+            targets=targets_np,
+            preds=preds_np,
+            out_file=os.path.join(fan_out_dir, f"fan_epoch_{epoch_number:05d}.png"),
+            max_paths=max_paths,
+        )
+
+    if times_to_save is None:
+        return ResultsDict(eval_metric=None, results_times=[], results=[])
+
+    preds_batches = preds if isinstance(preds, list) else [preds]
+    targets_batches = targets if isinstance(targets, list) else [targets]
+
+    def _as_spd_mats_at_time(x: jax.Array, t: int) -> np.ndarray:
+        """Extract SPD matrices at time t as (B,3,3) NumPy array.
+
+        Accepts:
+        - (B, T, 3, 3) explicit matrices
+        - (B, T, 6) vech representation
+        """
+        x_np = np.array(jax.device_get(x))
+        if x_np.ndim == 4 and x_np.shape[-2:] == (3, 3):
+            return np.asarray(x_np[:, t, :, :], dtype=np.float64)
+        if x_np.ndim == 3 and int(x_np.shape[-1]) == 6:
+            # Unvech each sample at the selected time index.
+            xt = x_np[:, t, :]  # (B, 6)
+            from stochastax.manifolds.spd import SPDManifold
+
+            mats = SPDManifold.unvech(jax.device_put(xt.astype(np.float32)))
+            return np.asarray(jax.device_get(mats), dtype=np.float64)
+        raise ValueError(
+            f"Expected preds/targets shaped (B,T,6) or (B,T,3,3); got {x_np.shape}"
+        )
+
+    def _eigvals_at_time(x: jax.Array, t: int) -> np.ndarray:
+        mats = _as_spd_mats_at_time(x, t)
+        # Symmetrise to stabilise eigenvalues under FP noise.
+        mats = 0.5 * (mats + np.swapaxes(mats, -1, -2))
+        eigs = np.linalg.eigvalsh(mats)  # (B, 3)
+        # Clip to avoid negative/zero eigenvalues from numerical error.
+        eps = 1e-12
+        eigs = np.clip(eigs, eps, None)
+        if os.environ.get("SPD_COV_W1_LOGEIG", "0") == "1":
+            eigs = np.log(eigs)
+        return eigs
+
+    w1_stats: list[float] = []
+    for t in times_to_save:
+        w1_per_batch: list[float] = []
+        for pb, tb in zip(preds_batches, targets_batches):
+            pred_eigs = _eigvals_at_time(pb, int(t))  # (B, 3)
+            target_eigs = _eigvals_at_time(tb, int(t))  # (B, 3)
+            # 1D Wasserstein per eigenvalue coordinate, then average.
+            w1_eigs = []
+            for k in range(3):
+                w1_eigs.append(
+                    float(wasserstein_distance(pred_eigs[:, k], target_eigs[:, k]))
+                )
+            w1_per_batch.append(float(np.mean(w1_eigs)))
+        w1_stats.append(float(np.mean(w1_per_batch)))
+
+    return ResultsDict(
+        eval_metric=float(np.median(w1_stats)),
+        results_times=[float(t) for t in times_to_save],
+        results=[float(s) for s in w1_stats],
+    )

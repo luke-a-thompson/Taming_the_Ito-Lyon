@@ -24,6 +24,9 @@ class Datasets(Enum):
     SPD_COVARIANCE_SOLAR = Path(
         "data/spd_covariance/solar_spd_covariance_trajectory.npz"
     )
+    SPD_WISHART_DIFFUSION = Path(
+        "data/synthetic_diffusions/wishart_diffusion_data.npz"
+    )
 
 
 class ModelType(StrEnum):
